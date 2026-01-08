@@ -1,0 +1,51 @@
+# configs/datasets.yaml
+data_root: "E:/ReAct-IR/data"
+
+# 각 dataset python class가 기대하는 root는
+# 예) CSDDataset(root="E:/ReAct-IR/data", ...) 내부에서 "CSD" 하위 폴더로 들어감
+# rain100은 base=".../rain100H" 또는 ".../rain100L" 등 내부에서 처리하게 구현되어 있음
+
+datasets:
+  csd:
+    type: "CSDDataset"
+    split: "train"
+
+  day_raindrop:
+    type: "DayRainDropDataset"
+    split: "train"
+
+  night_raindrop:
+    type: "NightRainDropDataset"
+    split: "train"
+
+  rain100h:
+    type: "Rain100Dataset"
+    variant: "H"
+    split: "train"
+
+  rain100l:
+    type: "Rain100Dataset"
+    variant: "L"
+    split: "test"
+
+  reside6k:
+    type: "RESIDE6KDataset"
+    split: "train"
+
+mixed:
+  enabled: true
+  balance: "sqrt"        # "uniform" | "proportional" | "sqrt"
+  epoch_length: 2000
+  seed: 123
+
+loader:
+  batch_size: 2
+  num_workers: 0
+  pin_memory: true
+  drop_last: true
+
+train_patch:
+  enabled: true
+  patch_size: 256
+  random_flip: true
+  random_rot90: true

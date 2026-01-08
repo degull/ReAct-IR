@@ -1,0 +1,12 @@
+# configs/react_ir.yaml
+agent:
+  max_steps: 5
+  stop_threshold: 0.10
+  uncertainty_threshold: 0.35
+  fallback_action: "A_HYBRID"
+
+inference:
+  save_traces: true
+  save_images: true
+  trace_dir: "E:/ReAct-IR/results/action_traces"
+  image_dir: "E:/ReAct-IR/results/qualitative"
