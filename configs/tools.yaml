@@ -41,6 +41,10 @@ toolbank:
       runtime_scale: 0.8
 
 train:
+  lambda_contrast: 0.05       # ⭐ 핵심 (처음엔 0.05~0.1 추천)
+  contrast_warmup_steps: 0    # 처음부터 켜기
+  contrast_every: 20           # 매 step 적용
+
   lr: 0.0002
   weight_decay: 0.0
   betas: [0.9, 0.999]

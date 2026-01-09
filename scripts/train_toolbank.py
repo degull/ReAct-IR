@@ -8,6 +8,7 @@ from collections import defaultdict
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.amp import autocast, GradScaler
 from tqdm import tqdm
@@ -190,6 +191,37 @@ def output_diff_vs_stop(toolbank: ToolBank, x: torch.Tensor, action: str) -> flo
     return float((out_act - out_stop).abs().mean().item())
 
 
+@torch.no_grad()
+def action_separation_score(
+    toolbank: ToolBank,
+    x: torch.Tensor,
+    sel_action: str,
+    neg_action: str,
+) -> float:
+    """
+    (추가 SANITY) action separation score:
+      score = mean(|f_sel(x) - f_neg(x)|) / (mean(|f_sel(x) - f_stop(x)|) + eps)
+
+    - 분리(score ↑): 선택 action 출력이 다른 action과 충분히 다름
+    - 정상화(denom): LoRA 자체의 유효 영향(Stop 대비)을 기준으로 스케일 불변 비교
+    """
+    eps = 1e-8
+    x1 = x[:1]
+
+    toolbank.activate_adapter(A_STOP)
+    out_stop = toolbank.backbone(x1)
+
+    toolbank.activate_adapter(sel_action)
+    out_sel = toolbank.backbone(x1)
+
+    toolbank.activate_adapter(neg_action)
+    out_neg = toolbank.backbone(x1)
+
+    num = float((out_sel - out_neg).abs().mean().item())
+    den = float((out_sel - out_stop).abs().mean().item())
+    return float(num / (den + eps))
+
+
 # --------------------------------------------------
 # Dataset Factory
 # --------------------------------------------------
@@ -223,6 +255,29 @@ def build_mixed_dataset(cfg, tfm):
 
 
 # --------------------------------------------------
+# Action-Contrastive helpers (최소 변경)
+# --------------------------------------------------
+ALL_ACTIONS = [A_DEDROP, A_DEBLUR, A_DERAIN, A_DESNOW, A_DEHAZE, A_HYBRID]
+
+
+def sample_negative_action(pos_action: str, oracle_actions: List[str]) -> str:
+    """
+    negative action 1개 샘플.
+    - 기본: pos_action 제외한 전체 action 중 랜덤
+    - oracle_actions(배치 내 다양성)가 있다면 거기서 먼저 뽑아주는 게 더 'hard negative'가 될 수 있음
+    """
+    # hard negative 우선: 같은 배치 oracle 안에서 pos와 다른 action이 있으면 거기서 선택
+    uniq = list(set(oracle_actions))
+    cand = [a for a in uniq if a != pos_action]
+    if len(cand) > 0:
+        return random.choice(cand)
+
+    # fallback: 전체 action 중 pos 제외
+    cand2 = [a for a in ALL_ACTIONS if a != pos_action]
+    return random.choice(cand2)
+
+
+# --------------------------------------------------
 # Main
 # --------------------------------------------------
 def main():
@@ -239,6 +294,27 @@ def main():
     # tools.yaml에 없으면 기본값 사용
     sanity_every = int(cfg_tools.get("train", {}).get("sanity_every", 200))
     diff_every = int(cfg_tools.get("train", {}).get("diff_every", 500))
+
+    # ------------------------------
+    # (Condition-1) Action 실패 시 손해: action_specific_penalty
+    #   - 배치 내 oracle action과 선택 action이 불일치한 비율(mismatch_rate)에 비례해 loss에 가산
+    # ------------------------------
+    action_specific_penalty = float(cfg_tools.get("train", {}).get("action_specific_penalty", 0.0))
+
+    # ------------------------------
+    # (Condition-3) 되돌릴 수 없는 선택: switch_cost
+    #   - 직전 step의 action과 다르면 loss에 switch_cost 가산
+    # ------------------------------
+    switch_cost = float(cfg_tools.get("train", {}).get("switch_cost", 0.0))
+
+    # ------------------------------
+    # (NEW) Action-Contrastive Loss
+    #   loss = L_rec + lambda_contrast * |f_a(x) - f_a'(x)|_1
+    #   - a'는 negative action 1개만 샘플
+    # ------------------------------
+    lambda_contrast = float(cfg_tools.get("train", {}).get("lambda_contrast", 0.0))
+    contrast_warmup_steps = int(cfg_tools.get("train", {}).get("contrast_warmup_steps", 0))
+    contrast_every = int(cfg_tools.get("train", {}).get("contrast_every", 1))  # 매 step 계산하면 비용↑, N step마다 적용 가능
 
     # Dataset
     tfm = PairedTransform(cfg_ds["train_patch"]["patch_size"])
@@ -283,6 +359,9 @@ def main():
     action_loss_sum: DefaultDict[str, float] = defaultdict(float)
     action_count: DefaultDict[str, int] = defaultdict(int)
 
+    # (Condition-3) 직전 action tracking
+    prev_action: str = A_STOP
+
     t0 = time.time()
 
     for epoch in range(epochs):
@@ -298,12 +377,59 @@ def main():
             x = batch["input"].to(device, non_blocking=True)
             gt = batch["gt"].to(device, non_blocking=True)
 
-            actions = [choose_oracle_action(m["degradations"]) for m in batch["meta"]]
-            action = max(set(actions), key=actions.count)
+            # 배치 각 샘플의 oracle action
+            oracle_actions = [choose_oracle_action(m["degradations"]) for m in batch["meta"]]
+            # 현재 step에서 사용할 action (다수결)
+            action = max(set(oracle_actions), key=oracle_actions.count)
+
+            # (Condition-1) action 실패 손해: mismatch rate 기반 penalty
+            if action_specific_penalty > 0.0:
+                mismatch = sum(1 for a in oracle_actions if a != action)
+                mismatch_rate = float(mismatch) / float(max(1, len(oracle_actions)))
+                loss_pen_action = action_specific_penalty * mismatch_rate
+            else:
+                mismatch_rate = 0.0
+                loss_pen_action = 0.0
+
+            # (Condition-3) switch cost: 되돌릴 수 없는 선택(전환 비용)
+            if switch_cost > 0.0 and prev_action != A_STOP and action != prev_action:
+                loss_pen_switch = switch_cost
+            else:
+                loss_pen_switch = 0.0
+
+            # (NEW) negative action 샘플 (contrast 계산 시 필요)
+            neg_action = None
+            use_contrast = (lambda_contrast > 0.0)
+            if use_contrast:
+                if global_step >= max(0, contrast_warmup_steps) and (contrast_every <= 1 or (global_step % contrast_every == 0)):
+                    neg_action = sample_negative_action(action, oracle_actions)
+                else:
+                    use_contrast = False  # warmup/every 조건 미충족이면 이번 step은 contrast off
 
             with autocast(device_type="cuda"):
+                # main prediction
                 pred = toolbank.apply(x, action)
-                loss = charbonnier_loss(pred, gt)
+                loss_rec = charbonnier_loss(pred, gt)
+
+                # 최종 loss = 복원 loss + (조건1) + (조건3) + (NEW contrast)
+                loss = loss_rec
+
+                if loss_pen_action > 0.0:
+                    loss = loss + loss_rec.new_tensor(loss_pen_action)
+                if loss_pen_switch > 0.0:
+                    loss = loss + loss_rec.new_tensor(loss_pen_switch)
+
+                # (NEW) Action-Contrastive Loss (negative 1개)
+                # - 같은 x로 다른 action 출력도 계산 (추가 forward 1회)
+                loss_contrast_val = 0.0
+                if use_contrast and (neg_action is not None):
+                    # contrast는 1 sample만
+                    x_c = x[:1]
+                    pred_c = pred[:1]
+                    pred_neg = toolbank.apply(x_c, neg_action)
+                    l_con = torch.mean(torch.abs(pred_c - pred_neg))
+                    loss = loss + (loss_rec.new_tensor(lambda_contrast) * l_con)
+                    loss_contrast_val = float(l_con.detach().item())
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -316,11 +442,7 @@ def main():
                 scaler.unscale_(optimizer)
 
                 g_sel = lora_grad_norm_for_action(toolbank, action)
-
-                # 비교용: 다른 action 하나(하이브리드)도 같이 찍으면 분기 확인이 쉬움
                 g_hyb = lora_grad_norm_for_action(toolbank, A_HYBRID) if action != A_HYBRID else 0.0
-
-                # 선택 안 된 action들 중 1~2개만 비교 (비용 절감)
                 g_drop = lora_grad_norm_for_action(toolbank, A_DEDROP) if action != A_DEDROP else 0.0
                 g_blur = lora_grad_norm_for_action(toolbank, A_DEBLUR) if action != A_DEBLUR else 0.0
 
@@ -336,12 +458,20 @@ def main():
             # ------------------------------
             # SANITY 2) 출력 차이(Stop 대비) - 가끔만
             # ------------------------------
+            sep_score = None
             if diff_every > 0 and (global_step % diff_every == 0):
                 toolbank.eval()
                 with torch.no_grad():
                     d_out = output_diff_vs_stop(toolbank, x, action)
+
+                    # (NEW) action separation score
+                    # - 이번 step에 neg_action이 없었으면(contrast off) 하드네거티브 하나 다시 샘플
+                    neg_for_sanity = neg_action if (neg_action is not None) else sample_negative_action(action, oracle_actions)
+                    sep_score = action_separation_score(toolbank, x, action, neg_for_sanity)
+
                 toolbank.train()
                 print(f"[SANITY][diff] step={global_step} act={action} Δout_vs_stop={d_out:.6f}")
+                print(f"[SANITY][sep ] step={global_step} act={action} neg={neg_for_sanity} sep_score={sep_score:.4f}")
 
             # loss/stat updates
             loss_val = float(loss.item())
@@ -352,8 +482,15 @@ def main():
             action_count[action] += 1
 
             elapsed = time.time() - t0
+
+            # progress text (기존 출력 유지 + penalty/contrast 정보만 덧붙임)
+            # - 기존: loss, act, m, sw, t 유지
+            # - 추가: con(contrast L1)만 표시 (계산 안 한 step은 0.000)
+            sw_flag = 1 if (prev_action != A_STOP and action != prev_action) else 0
             pbar.set_description(
-                f"Epoch {epoch+1}/{epochs} | loss={avg_loss:.4f} | act={action} | t={elapsed/60:.1f}m"
+                f"Epoch {epoch+1}/{epochs} | loss={avg_loss:.4f} | act={action} | "
+                f"m={mismatch_rate:.2f} | sw={sw_flag} | con={loss_contrast_val:.4f} | "
+                f"t={elapsed/60:.1f}m"
             )
 
             # Iteration checkpoint
@@ -361,6 +498,9 @@ def main():
                 iter_path = os.path.join(save_dir, f"iter_{global_step}_loss{avg_loss:.4f}.pth")
                 torch.save({"toolbank": toolbank.state_dict(), "step": global_step}, iter_path)
                 print(f"[CKPT] Saved: {iter_path}")
+
+            # (Condition-3) prev_action 갱신 (step 끝에서 업데이트)
+            prev_action = action
 
         # Epoch checkpoint
         epoch_loss = total / max(1, len(loader))
