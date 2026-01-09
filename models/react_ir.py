@@ -16,7 +16,7 @@ if ROOT not in sys.path:
 from models.toolbank.toolbank import (
     ToolBank,
     A_DEDROP, A_DEBLUR, A_DERAIN, A_DEHAZE,
-    A_DENOISE, A_DEJPEG, A_HYBRID, A_STOP,
+    A_DESNOW, A_HYBRID, A_STOP,
 )
 
 
@@ -70,8 +70,8 @@ class RulePlanner(nn.Module):
             return A_DERAIN
         if z.get("haze", 0) > tau:
             return A_DEHAZE
-        if z.get("noise", 0) > tau:
-            return A_DENOISE
+        if z.get("snow", 0) > tau:
+            return A_DESNOW
 
         return A_STOP
 

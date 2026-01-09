@@ -13,10 +13,8 @@ Planner / ToolBank / ReAct-IR core 모두가
 A_DEDROP  = "A_DEDROP"    # raindrop / raindot removal
 A_DEBLUR  = "A_DEBLUR"    # motion / defocus blur
 A_DERAIN  = "A_DERAIN"    # rain streak
-A_DENOISE = "A_DENOISE"   # noise
 A_DEHAZE  = "A_DEHAZE"    # haze / fog
-A_DEJPEG  = "A_DEJPEG"    # jpeg artifacts
-
+A_DESNOW  = "A_DESNOW"
 # -------------------------
 # Meta / control actions
 # -------------------------
@@ -32,9 +30,8 @@ ALL_ACTIONS = [
     A_DEDROP,
     A_DEBLUR,
     A_DERAIN,
-    A_DENOISE,
+    A_DESNOW,
     A_DEHAZE,
-    A_DEJPEG,
     A_HYBRID,
     A_STOP,
     A_ABORT,

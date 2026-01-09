@@ -4,8 +4,8 @@ import torch.nn as nn
 from typing import Dict, List
 
 from models.planner.action_space import (
-    A_DEDROP, A_DEBLUR, A_DERAIN, A_DENOISE,
-    A_DEHAZE, A_DEJPEG, A_HYBRID, A_STOP
+    A_DEDROP, A_DEBLUR, A_DERAIN, A_DESNOW,
+    A_DEHAZE, A_HYBRID, A_STOP
 )
 
 
@@ -63,12 +63,10 @@ class PlannerLLM(nn.Module):
             return A_DEBLUR
         if z.get("rain", 0.0) > 0.3:
             return A_DERAIN
-        if z.get("noise", 0.0) > 0.3:
-            return A_DENOISE
+        if z.get("snow", 0.0) > 0.3:
+            return A_DESNOW
         if z.get("haze", 0.0) > 0.3:
             return A_DEHAZE
-        if z.get("jpeg", 0.0) > 0.3:
-            return A_DEJPEG
 
         # 4) Fallback
         return A_HYBRID

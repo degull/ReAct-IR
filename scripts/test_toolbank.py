@@ -22,7 +22,7 @@ if PROJECT_ROOT not in sys.path:
 from models.backbone.vetnet import VETNet
 from models.toolbank.toolbank import ToolBank, AdapterSpec
 from models.planner.action_space import (
-    A_DEDROP, A_DEBLUR, A_DERAIN, A_DENOISE, A_DEHAZE, A_HYBRID
+    A_DEDROP, A_DEBLUR, A_DERAIN, A_DESNOW, A_DEHAZE, A_HYBRID
 )
 
 import yaml
@@ -41,7 +41,7 @@ ACTIONS = [
     A_DEHAZE,
     A_DERAIN,
     A_DEDROP,
-    A_DENOISE,
+    A_DESNOW,
     A_DEBLUR,
     A_HYBRID,
 ]

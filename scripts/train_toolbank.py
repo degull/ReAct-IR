@@ -1,286 +1,10 @@
-""" # scripts/train_toolbank.py
+# scripts/train_toolbank.py
 import os
 import sys
 import time
 import random
-from typing import List
-
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
-from torch.amp import autocast
-from torch.amp import GradScaler
-from tqdm import tqdm
-
-# --------------------------------------------------
-# Make project import-safe
-# --------------------------------------------------
-CUR_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.abspath(os.path.join(CUR_DIR, ".."))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
-
-# --------------------------------------------------
-# Imports
-# --------------------------------------------------
-from datasets.mixed_dataset import MixedDataset
-from datasets.csd import CSDDataset
-from datasets.rain100 import Rain100Dataset
-from datasets.raindrop_day import DayRainDropDataset
-from datasets.raindrop_night import NightRainDropDataset
-from datasets.reside6k import RESIDE6KDataset
-
-from models.backbone.vetnet import VETNet
-from models.toolbank.toolbank import ToolBank, AdapterSpec
-
-from models.planner.action_space import (
-    A_DEDROP, A_DEBLUR, A_DERAIN, A_DENOISE, A_DEHAZE, A_DEJPEG, A_HYBRID
-)
-
-# --------------------------------------------------
-# Utils
-# --------------------------------------------------
-import yaml
-import numpy as np
-from PIL import Image
-
-def load_yaml(p):
-    with open(p, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
-
-def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-# --------------------------------------------------
-# Loss
-# --------------------------------------------------
-def charbonnier_loss(pred, target, eps=1e-3):
-    return torch.mean(torch.sqrt((pred - target) ** 2 + eps ** 2))
-
-# --------------------------------------------------
-# Paired Transform
-# --------------------------------------------------
-def _pil_to_tensor(img: Image.Image):
-    arr = np.array(img).astype(np.float32) / 255.0
-    if arr.ndim == 2:
-        arr = np.stack([arr, arr, arr], axis=-1)
-    return torch.from_numpy(arr.transpose(2, 0, 1))
-
-def _random_crop_pair(inp, gt, patch):
-    w, h = inp.size
-    if w < patch or h < patch:
-        scale = max(patch / w, patch / h)
-        nw, nh = int(w * scale), int(h * scale)
-        inp = inp.resize((nw, nh), Image.BILINEAR)
-        gt  = gt.resize((nw, nh), Image.BILINEAR)
-        w, h = inp.size
-    x = random.randint(0, w - patch)
-    y = random.randint(0, h - patch)
-    return inp.crop((x, y, x + patch, y + patch)), gt.crop((x, y, x + patch, y + patch))
-
-def _augment_pair(inp, gt):
-    if random.random() < 0.5:
-        inp = inp.transpose(Image.FLIP_LEFT_RIGHT)
-        gt  = gt.transpose(Image.FLIP_LEFT_RIGHT)
-    k = random.randint(0, 3)
-    if k > 0:
-        inp = inp.rotate(90 * k, expand=True)
-        gt  = gt.rotate(90 * k, expand=True)
-    return inp, gt
-
-class PairedTransform:
-    def __init__(self, patch_size=256):
-        self.patch_size = patch_size
-
-    def __call__(self, inp, gt):
-        inp, gt = _random_crop_pair(inp, gt, self.patch_size)
-        inp, gt = _augment_pair(inp, gt)
-        return _pil_to_tensor(inp), _pil_to_tensor(gt)
-
-# --------------------------------------------------
-# Oracle Action
-# --------------------------------------------------
-def choose_oracle_action(degs: List[str]) -> str:
-    d = set(x.lower() for x in degs)
-    if "drop" in d:  return A_DEDROP
-    if "rain" in d:  return A_DERAIN
-    if "haze" in d:  return A_DEHAZE
-    if "noise" in d: return A_DENOISE
-    if "jpeg" in d:  return A_DEJPEG
-    if "blur" in d:  return A_DEBLUR
-    return A_HYBRID
-
-# --------------------------------------------------
-# Custom Collate
-# --------------------------------------------------
-def react_ir_collate_fn(batch):
-    return {
-        "input": torch.stack([b["input"] for b in batch], dim=0),
-        "gt": torch.stack([b["gt"] for b in batch], dim=0),
-        "meta": [b["meta"] for b in batch],
-    }
-
-# --------------------------------------------------
-# LoRA Param Collection (DEDUP)
-# --------------------------------------------------
-def collect_lora_params(model: nn.Module):
-    params = []
-    seen = set()
-    for m in model.modules():
-        if hasattr(m, "is_lora") and m.is_lora:
-            for p in m.parameters():
-                if id(p) not in seen:
-                    p.requires_grad = True
-                    params.append(p)
-                    seen.add(id(p))
-    return params
-
-# --------------------------------------------------
-# Dataset Factory
-# --------------------------------------------------
-def build_single_dataset(root, cfg, tfm):
-    t = cfg["type"]
-    split = cfg.get("split", "train")
-    if t == "CSDDataset":
-        return CSDDataset(root=root, split=split, transform=tfm, debug=False)
-    if t == "DayRainDropDataset":
-        return DayRainDropDataset(root=root, split=split, transform=tfm, debug=False)
-    if t == "NightRainDropDataset":
-        return NightRainDropDataset(root=root, split=split, transform=tfm, debug=False)
-    if t == "Rain100Dataset":
-        return Rain100Dataset(root=root, split=split, transform=tfm, debug=False)
-    if t == "RESIDE6KDataset":
-        return RESIDE6KDataset(root=root, split=split, transform=tfm, debug=False)
-    raise ValueError(t)
-
-def build_mixed_dataset(cfg, tfm):
-    root = cfg["data_root"]
-    mixed = cfg["mixed"]
-    datasets = [build_single_dataset(root, dcfg, tfm) for dcfg in cfg["datasets"].values()]
-    return MixedDataset(
-        datasets=datasets,
-        balance=mixed.get("balance", "sqrt"),
-        epoch_length=int(mixed.get("epoch_length", 20000)),
-        seed=int(mixed.get("seed", 123)),
-        debug=True,
-    )
-
-# --------------------------------------------------
-# Main
-# --------------------------------------------------
-def main():
-    cfg_ds = load_yaml(os.path.join(PROJECT_ROOT, "configs", "datasets.yaml"))
-    cfg_tools = load_yaml(os.path.join(PROJECT_ROOT, "configs", "tools.yaml"))
-
-    set_seed(int(cfg_ds.get("mixed", {}).get("seed", 123)))
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("[Device]", device)
-
-    # Dataset
-    tfm = PairedTransform(cfg_ds["train_patch"]["patch_size"])
-    train_set = build_mixed_dataset(cfg_ds, tfm)
-
-    loader = DataLoader(
-        train_set,
-        batch_size=cfg_ds["loader"]["batch_size"],
-        shuffle=True,
-        num_workers=cfg_ds["loader"]["num_workers"],
-        pin_memory=True,
-        drop_last=True,
-        collate_fn=react_ir_collate_fn,
-    )
-
-    # Model
-    backbone = VETNet(dim=48, volterra_rank=4).to(device)
-    adapter_specs = {a: AdapterSpec(**s) for a, s in cfg_tools["toolbank"]["adapters"].items()}
-    toolbank = ToolBank(backbone, adapter_specs, device=device, debug=True).to(device)
-
-    for p in toolbank.backbone.parameters():
-        p.requires_grad = False
-
-    trainable = collect_lora_params(toolbank)
-    print(f"[Trainable LoRA] {sum(p.numel() for p in trainable)/1e6:.2f} M params")
-
-    optimizer = torch.optim.AdamW(trainable, lr=cfg_tools["train"]["lr"])
-    scaler = GradScaler("cuda")
-
-    # Training
-    save_dir = cfg_tools["paths"]["ckpt_dir"]
-    os.makedirs(save_dir, exist_ok=True)
-
-    epochs = cfg_tools["train"]["epochs"]
-    save_every = cfg_tools["train"].get("save_every", 2000)
-
-    global_step = 0
-    toolbank.train()
-
-    for epoch in range(epochs):
-        total = 0.0
-        pbar = tqdm(loader, ncols=120)
-
-        for batch in pbar:
-            global_step += 1
-
-            x = batch["input"].to(device)
-            gt = batch["gt"].to(device)
-
-            actions = [choose_oracle_action(m["degradations"]) for m in batch["meta"]]
-            action = max(set(actions), key=actions.count)
-
-            with autocast(device_type="cuda"):
-                pred = toolbank.apply(x, action)
-                loss = charbonnier_loss(pred, gt)
-
-            optimizer.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-
-            total += loss.item()
-            avg_loss = total / (pbar.n + 1)
-
-            pbar.set_description(
-                f"Epoch {epoch+1}/{epochs} | loss={avg_loss:.4f} | act={action}"
-            )
-
-            # Iteration checkpoint (loss 포함)
-            if global_step % save_every == 0:
-                iter_path = os.path.join(
-                    save_dir, f"iter_{global_step}_loss{avg_loss:.4f}.pth"
-                )
-                torch.save({"toolbank": toolbank.state_dict()}, iter_path)
-
-        # Epoch checkpoint (loss 포함)
-        epoch_loss = total / len(loader)
-        ckpt_path = os.path.join(
-            save_dir, f"epoch_{epoch+1:03d}_loss{epoch_loss:.4f}.pth"
-        )
-        torch.save(
-            {
-                "epoch": epoch + 1,
-                "toolbank": toolbank.state_dict(),
-                "optimizer": optimizer.state_dict(),
-            },
-            ckpt_path,
-        )
-        print(f"[CKPT] Saved: {ckpt_path}")
-
-    print("[Train] Done ✅")
-
-if __name__ == "__main__":
-    main()
- """
-
-# 이어서 학습
-# scripts/train_toolbank.py
-# scripts/train_toolbank.py
-import os
-import sys
-import random
-from typing import List
+from typing import List, Dict, DefaultDict
+from collections import defaultdict
 
 import torch
 import torch.nn as nn
@@ -310,7 +34,7 @@ from models.backbone.vetnet import VETNet
 from models.toolbank.toolbank import ToolBank, AdapterSpec
 
 from models.planner.action_space import (
-    A_DEDROP, A_DEBLUR, A_DERAIN, A_DENOISE, A_DEHAZE, A_DEJPEG, A_HYBRID
+    A_DEDROP, A_DEBLUR, A_DESNOW, A_DERAIN, A_DEHAZE, A_HYBRID, A_STOP
 )
 
 # --------------------------------------------------
@@ -360,10 +84,7 @@ def _random_crop_pair(inp, gt, patch):
         w, h = inp.size
     x = random.randint(0, w - patch)
     y = random.randint(0, h - patch)
-    return (
-        inp.crop((x, y, x + patch, y + patch)),
-        gt.crop((x, y, x + patch, y + patch)),
-    )
+    return inp.crop((x, y, x + patch, y + patch)), gt.crop((x, y, x + patch, y + patch))
 
 
 def _augment_pair(inp, gt):
@@ -398,10 +119,8 @@ def choose_oracle_action(degs: List[str]) -> str:
         return A_DERAIN
     if "haze" in d:
         return A_DEHAZE
-    if "noise" in d:
-        return A_DENOISE
-    if "jpeg" in d:
-        return A_DEJPEG
+    if "snow" in d:
+        return A_DESNOW
     if "blur" in d:
         return A_DEBLUR
     return A_HYBRID
@@ -419,7 +138,7 @@ def react_ir_collate_fn(batch):
 
 
 # --------------------------------------------------
-# LoRA Param Collection
+# LoRA Param Collection (DEDUP)
 # --------------------------------------------------
 def collect_lora_params(model: nn.Module):
     params = []
@@ -432,6 +151,43 @@ def collect_lora_params(model: nn.Module):
                     params.append(p)
                     seen.add(id(p))
     return params
+
+
+# --------------------------------------------------
+# ToolBank Sanity Metrics (핵심: 학습 중 on/off 검증)
+# --------------------------------------------------
+def lora_grad_norm_for_action(toolbank: ToolBank, action: str) -> float:
+    """
+    현재 step에서 action에 해당하는 LoRA 모듈들의 grad L2 norm 합.
+    - action이 제대로 분기되면: 선택된 action의 grad norm이 상대적으로 커지고,
+      선택 안 된 action들은 매우 작아야 정상.
+    """
+    total = 0.0
+    modules = toolbank.adapters.get(action, [])
+    for m in modules:
+        for p in m.parameters():
+            if p.grad is not None:
+                total += float(p.grad.data.norm(2).item())
+    return total
+
+
+@torch.no_grad()
+def output_diff_vs_stop(toolbank: ToolBank, x: torch.Tensor, action: str) -> float:
+    """
+    같은 입력 x에 대해:
+      - LoRA OFF (A_STOP) 출력
+      - 해당 action LoRA ON 출력
+    두 출력의 평균 절대차를 리턴.
+    - 0에 가깝다면 LoRA가 사실상 영향이 없는 상태일 수 있음.
+    """
+    x1 = x[:1]  # 비용 절감: 1개 샘플만
+    toolbank.activate_adapter(A_STOP)
+    out_stop = toolbank.backbone(x1)
+
+    toolbank.activate_adapter(action)
+    out_act = toolbank.backbone(x1)
+
+    return float((out_act - out_stop).abs().mean().item())
 
 
 # --------------------------------------------------
@@ -477,6 +233,13 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("[Device]", device)
 
+    # ------------------------------
+    # Sanity logging frequency
+    # ------------------------------
+    # tools.yaml에 없으면 기본값 사용
+    sanity_every = int(cfg_tools.get("train", {}).get("sanity_every", 200))
+    diff_every = int(cfg_tools.get("train", {}).get("diff_every", 500))
+
     # Dataset
     tfm = PairedTransform(cfg_ds["train_patch"]["patch_size"])
     train_set = build_mixed_dataset(cfg_ds, tfm)
@@ -506,56 +269,34 @@ def main():
     optimizer = torch.optim.AdamW(trainable, lr=cfg_tools["train"]["lr"])
     scaler = GradScaler("cuda")
 
-    # Save dir
+    # Training
     save_dir = cfg_tools["paths"]["ckpt_dir"]
     os.makedirs(save_dir, exist_ok=True)
 
-    # Training configs
     epochs = int(cfg_tools["train"]["epochs"])
-    save_every = 250  # 250 iteration마다 저장
+    save_every = int(cfg_tools["train"].get("save_every", 2000))
 
-    # --------------------------------------------------
-    # ✅ Resume (epoch ckpt 기준)
-    #   - start_epoch = ckpt["epoch"]
-    #   - global_step = start_epoch * len(loader)
-    # --------------------------------------------------
-    resume_path = cfg_tools.get("train", {}).get("resume_path", None)
-    start_epoch = 0
     global_step = 0
-
-    if resume_path is not None and str(resume_path).strip() != "":
-        print(f"[RESUME] Loading {resume_path}")
-        ckpt = torch.load(resume_path, map_location=device)
-
-        # 필수: toolbank
-        toolbank.load_state_dict(ckpt["toolbank"], strict=True)
-
-        # 선택: optimizer
-        if "optimizer" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer"])
-
-        # ✅ 핵심 수정 포인트
-        start_epoch = int(ckpt.get("epoch", 0))
-        global_step = start_epoch * len(loader)
-
-        print(f"[RESUME] start_epoch={start_epoch}, global_step={global_step}")
-    else:
-        print("[RESUME] None (start from scratch)")
-
     toolbank.train()
 
-    # --------------------------------------------------
-    # Training Loop (✅ for epoch in range(start_epoch, epochs))
-    # --------------------------------------------------
-    for epoch in range(start_epoch, epochs):
+    # epoch별 action 통계/손실 누적
+    action_loss_sum: DefaultDict[str, float] = defaultdict(float)
+    action_count: DefaultDict[str, int] = defaultdict(int)
+
+    t0 = time.time()
+
+    for epoch in range(epochs):
         total = 0.0
+        action_loss_sum.clear()
+        action_count.clear()
+
         pbar = tqdm(loader, ncols=120)
 
         for batch in pbar:
             global_step += 1
 
-            x = batch["input"].to(device)
-            gt = batch["gt"].to(device)
+            x = batch["input"].to(device, non_blocking=True)
+            gt = batch["gt"].to(device, non_blocking=True)
 
             actions = [choose_oracle_action(m["degradations"]) for m in batch["meta"]]
             action = max(set(actions), key=actions.count)
@@ -566,43 +307,86 @@ def main():
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
+
+            # ------------------------------
+            # SANITY 1) action별 grad norm (unscaled grad로 측정)
+            # ------------------------------
+            if sanity_every > 0 and (global_step % sanity_every == 0):
+                # unscale to read true grad magnitudes
+                scaler.unscale_(optimizer)
+
+                g_sel = lora_grad_norm_for_action(toolbank, action)
+
+                # 비교용: 다른 action 하나(하이브리드)도 같이 찍으면 분기 확인이 쉬움
+                g_hyb = lora_grad_norm_for_action(toolbank, A_HYBRID) if action != A_HYBRID else 0.0
+
+                # 선택 안 된 action들 중 1~2개만 비교 (비용 절감)
+                g_drop = lora_grad_norm_for_action(toolbank, A_DEDROP) if action != A_DEDROP else 0.0
+                g_blur = lora_grad_norm_for_action(toolbank, A_DEBLUR) if action != A_DEBLUR else 0.0
+
+                print(
+                    f"[SANITY][grad] step={global_step} act={action} "
+                    f"g_sel={g_sel:.4f} g_hyb={g_hyb:.4f} g_drop={g_drop:.4f} g_blur={g_blur:.4f}"
+                )
+
+            # optimizer step
             scaler.step(optimizer)
             scaler.update()
 
-            total += loss.item()
+            # ------------------------------
+            # SANITY 2) 출력 차이(Stop 대비) - 가끔만
+            # ------------------------------
+            if diff_every > 0 and (global_step % diff_every == 0):
+                toolbank.eval()
+                with torch.no_grad():
+                    d_out = output_diff_vs_stop(toolbank, x, action)
+                toolbank.train()
+                print(f"[SANITY][diff] step={global_step} act={action} Δout_vs_stop={d_out:.6f}")
+
+            # loss/stat updates
+            loss_val = float(loss.item())
+            total += loss_val
             avg_loss = total / (pbar.n + 1)
 
+            action_loss_sum[action] += loss_val
+            action_count[action] += 1
+
+            elapsed = time.time() - t0
             pbar.set_description(
-                f"Epoch {epoch+1}/{epochs} | step={global_step} | loss={avg_loss:.4f} | act={action}"
+                f"Epoch {epoch+1}/{epochs} | loss={avg_loss:.4f} | act={action} | t={elapsed/60:.1f}m"
             )
 
-            # Iteration checkpoint (every 250)
+            # Iteration checkpoint
             if global_step % save_every == 0:
-                ckpt_path = os.path.join(save_dir, f"iter_{global_step}_loss{avg_loss:.4f}.pth")
-                torch.save(
-                    {
-                        "epoch": epoch,  # 현재 epoch index (0-based)
-                        "toolbank": toolbank.state_dict(),
-                        "optimizer": optimizer.state_dict(),
-                        "global_step": global_step,
-                    },
-                    ckpt_path,
-                )
-                print(f"\n[CKPT] Saved: {ckpt_path}")
+                iter_path = os.path.join(save_dir, f"iter_{global_step}_loss{avg_loss:.4f}.pth")
+                torch.save({"toolbank": toolbank.state_dict(), "step": global_step}, iter_path)
+                print(f"[CKPT] Saved: {iter_path}")
 
-        # Epoch checkpoint (epoch 끝날 때마다 저장하고 싶으면 주석 해제)
+        # Epoch checkpoint
         epoch_loss = total / max(1, len(loader))
-        epoch_ckpt_path = os.path.join(save_dir, f"epoch_{epoch+1:03d}_loss{epoch_loss:.4f}.pth")
+        ckpt_path = os.path.join(save_dir, f"epoch_{epoch+1:03d}_loss{epoch_loss:.4f}.pth")
         torch.save(
             {
-                "epoch": epoch + 1,  # ✅ 다음 epoch 시작값으로 쓰기 위해 +1 저장
+                "epoch": epoch + 1,
+                "step": global_step,
                 "toolbank": toolbank.state_dict(),
                 "optimizer": optimizer.state_dict(),
-                "global_step": global_step,
             },
-            epoch_ckpt_path,
+            ckpt_path,
         )
-        print(f"[CKPT] Saved: {epoch_ckpt_path}")
+        print(f"[CKPT] Saved: {ckpt_path}")
+
+        # ------------------------------
+        # Epoch summary: action-wise loss
+        # ------------------------------
+        print(f"[Epoch {epoch+1}] Action-wise mean loss:")
+        for a in [A_DEDROP, A_DEBLUR, A_DERAIN, A_DESNOW, A_DEHAZE, A_HYBRID]:
+            c = action_count.get(a, 0)
+            if c > 0:
+                m = action_loss_sum[a] / c
+                print(f"  - {a:<8} : count={c:5d} mean_loss={m:.4f}")
+            else:
+                print(f"  - {a:<8} : count=    0 mean_loss=NA")
 
     print("[Train] Done ✅")
 

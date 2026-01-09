@@ -38,15 +38,22 @@ class LoRALinear(nn.Module):
 
 
 class LoRAConv2d(nn.Module):
-    def __init__(self, base: nn.Conv2d, r: int = 4, alpha: float = 1.0):
+    def __init__(
+        self,
+        base: nn.Conv2d,
+        r: int = 4,
+        alpha: float = 1.0,
+        force_nonzero_init: bool = False,  # 🔥 추가
+    ):
         super().__init__()
         self.is_lora = True
         self.base = base
 
         self.r = r
         self.alpha = alpha
+        self.force_nonzero_init = force_nonzero_init
 
-        # 🔥 scale은 반드시 Tensor 🔥
+        # scale은 반드시 Tensor
         self.register_buffer("scale", torch.tensor(alpha / r))
 
         self.lora_A = nn.Conv2d(
@@ -63,11 +70,17 @@ class LoRAConv2d(nn.Module):
         )
 
         nn.init.kaiming_uniform_(self.lora_A.weight, a=5 ** 0.5)
-        nn.init.zeros_(self.lora_B.weight)
+
+        if force_nonzero_init:
+            nn.init.kaiming_uniform_(self.lora_B.weight, a=5 ** 0.5)
+            print("[DEBUG] LoRAConv2d force_nonzero_init=ON")
+        else:
+            nn.init.zeros_(self.lora_B.weight)
 
         # freeze base conv
         for p in self.base.parameters():
             p.requires_grad = False
+
 
     def set_scale(self, s: float):
         self.scale.data = self.scale.new_tensor(s)
