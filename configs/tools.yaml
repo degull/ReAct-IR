@@ -50,7 +50,8 @@ train:
 
   amp: true
   log_every: 50
-  save_every: 1
+  save_every: 250
+  resume_path: E:/ReAct-IR/checkpoints/toolbank/epoch_001_loss0.1042.pth
   save_best: true
 
 paths:
