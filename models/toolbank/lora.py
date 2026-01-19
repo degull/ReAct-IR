@@ -1,18 +1,16 @@
 # models/toolbank/lora.py
 import torch
 import torch.nn as nn
+from torch import Tensor
 
 from typing import Dict, List, Optional, Sequence
-
-from torch import Tensor
-from torch.nn import Module, ModuleDict, Linear, Conv2d, Dropout, Dropout2d, Identity
 
 
 # ============================================================
 # Multi-Adapter LoRA (action-specific params, shared base)
 # ============================================================
 
-class MultiLoRALinear(Module):
+class MultiLoRALinear(nn.Module):
     """
     Multi-adapter LoRA for nn.Linear.
 
@@ -21,7 +19,7 @@ class MultiLoRALinear(Module):
 
     def __init__(
         self,
-        base: Linear,
+        base: nn.Linear,
         actions: Sequence[str],
         r: int = 4,
         alpha: float = 1.0,
@@ -44,14 +42,15 @@ class MultiLoRALinear(Module):
 
         self.actions: List[str] = list(actions)
 
-        self.lora_A: ModuleDict = ModuleDict()
-        self.lora_B: ModuleDict = ModuleDict()
-        self.lora_drop: ModuleDict = ModuleDict()
+        # NOTE: use nn.ModuleDict to avoid Pylance "module used as type" issues
+        self.lora_A = nn.ModuleDict()
+        self.lora_B = nn.ModuleDict()
+        self.lora_drop = nn.ModuleDict()
 
         for a in self.actions:
-            self.lora_A[a] = Linear(base.in_features, self.r, bias=False)
-            self.lora_B[a] = Linear(self.r, base.out_features, bias=False)
-            self.lora_drop[a] = Dropout(self.dropout_p) if self.dropout_p > 0 else Identity()
+            self.lora_A[a] = nn.Linear(base.in_features, self.r, bias=False)
+            self.lora_B[a] = nn.Linear(self.r, base.out_features, bias=False)
+            self.lora_drop[a] = nn.Dropout(self.dropout_p) if self.dropout_p > 0 else nn.Identity()
 
             nn.init.kaiming_uniform_(self.lora_A[a].weight, a=5 ** 0.5)
 
@@ -82,6 +81,8 @@ class MultiLoRALinear(Module):
 
     def forward(self, x: Tensor) -> Tensor:
         y = self.base(x)
+
+        # branch-skip: ensures inactive adapters do not participate in graph
         if (not self.active) or (self.current_action is None):
             return y
         if float(self.scale.detach().item()) == 0.0:
@@ -96,7 +97,7 @@ class MultiLoRALinear(Module):
         return y + z * (self.scale * base_scale)
 
 
-class MultiLoRAConv2d(Module):
+class MultiLoRAConv2d(nn.Module):
     """
     Multi-adapter LoRA for nn.Conv2d.
 
@@ -105,7 +106,7 @@ class MultiLoRAConv2d(Module):
 
     def __init__(
         self,
-        base: Conv2d,
+        base: nn.Conv2d,
         actions: Sequence[str],
         r: int = 4,
         alpha: float = 1.0,
@@ -128,13 +129,13 @@ class MultiLoRAConv2d(Module):
 
         self.actions: List[str] = list(actions)
 
-        self.lora_A: ModuleDict = ModuleDict()
-        self.lora_B: ModuleDict = ModuleDict()
-        self.lora_drop: ModuleDict = ModuleDict()
+        self.lora_A = nn.ModuleDict()
+        self.lora_B = nn.ModuleDict()
+        self.lora_drop = nn.ModuleDict()
 
         for a in self.actions:
-            self.lora_A[a] = Conv2d(base.in_channels, self.r, kernel_size=1, bias=False)
-            self.lora_B[a] = Conv2d(
+            self.lora_A[a] = nn.Conv2d(base.in_channels, self.r, kernel_size=1, bias=False)
+            self.lora_B[a] = nn.Conv2d(
                 self.r,
                 base.out_channels,
                 kernel_size=base.kernel_size,
@@ -143,7 +144,7 @@ class MultiLoRAConv2d(Module):
                 dilation=base.dilation,
                 bias=False,
             )
-            self.lora_drop[a] = Dropout2d(self.dropout_p) if self.dropout_p > 0 else Identity()
+            self.lora_drop[a] = nn.Dropout2d(self.dropout_p) if self.dropout_p > 0 else nn.Identity()
 
             nn.init.kaiming_uniform_(self.lora_A[a].weight, a=5 ** 0.5)
 
@@ -174,6 +175,8 @@ class MultiLoRAConv2d(Module):
 
     def forward(self, x: Tensor) -> Tensor:
         y = self.base(x)
+
+        # branch-skip: ensures inactive adapters do not participate in graph
         if (not self.active) or (self.current_action is None):
             return y
         if float(self.scale.detach().item()) == 0.0:
@@ -225,8 +228,8 @@ class MultiLoRAInjector:
             return True
         return any(t in name for t in self.target_modules)
 
-    def inject(self, model: Module) -> Dict[str, Module]:
-        injected: Dict[str, Module] = {}
+    def inject(self, model: nn.Module) -> Dict[str, nn.Module]:
+        injected: Dict[str, nn.Module] = {}
 
         # IMPORTANT: iterate on snapshot (tree changes during injection)
         for name, module in list(model.named_modules()):
@@ -238,7 +241,7 @@ class MultiLoRAInjector:
                 continue
             key = name.split(".")[-1]
 
-            if isinstance(module, Conv2d):
+            if isinstance(module, nn.Conv2d):
                 wrapped = MultiLoRAConv2d(
                     module,
                     actions=self.actions,
@@ -253,7 +256,7 @@ class MultiLoRAInjector:
                 if self.verbose:
                     print(f"[MultiLoRAInjector] Injected MultiLoRAConv2d: {name}")
 
-            elif self.enable_linear and isinstance(module, Linear):
+            elif self.enable_linear and isinstance(module, nn.Linear):
                 wrapped = MultiLoRALinear(
                     module,
                     actions=self.actions,
@@ -272,9 +275,9 @@ class MultiLoRAInjector:
             print(f"[MultiLoRAInjector] Total injected modules: {len(injected)}")
         return injected
 
-    def _get_parent(self, model: Module, name: str) -> Optional[Module]:
+    def _get_parent(self, model: nn.Module, name: str) -> Optional[nn.Module]:
         parts = name.split(".")
-        cur: Module = model
+        cur: nn.Module = model
         for p in parts[:-1]:
             if not hasattr(cur, p):
                 return None
@@ -286,21 +289,21 @@ class MultiLoRAInjector:
 # Debug / Smoke Test
 # ============================================================
 
-def _count_trainable_params(model: Module) -> int:
+def _count_trainable_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def _count_total_params(model: Module) -> int:
+def _count_total_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
 
 if __name__ == "__main__":
-    class DummyNet(Module):
+    class DummyNet(nn.Module):
         def __init__(self):
             super().__init__()
-            self.conv1 = Conv2d(3, 16, 3, padding=1)
-            self.conv2 = Conv2d(16, 16, 3, padding=1)
-            self.fc = Linear(16, 10)
+            self.conv1 = nn.Conv2d(3, 16, 3, padding=1)
+            self.conv2 = nn.Conv2d(16, 16, 3, padding=1)
+            self.fc = nn.Linear(16, 10)
 
         def forward(self, x: Tensor) -> Tensor:
             x = self.conv1(x)

@@ -34,8 +34,11 @@ from models.backbone.vetnet import VETNet
 from models.toolbank.toolbank import ToolBank, AdapterSpec
 
 from models.planner.action_space import (
-    A_DEDROP, A_DEBLUR, A_DESNOW, A_DERAIN, A_DEHAZE, A_HYBRID, A_STOP
+    A_DEDROP, A_DEBLUR, A_DESNOW, A_DERAIN, A_DEHAZE, A_STOP
 )
+
+# MultiLoRA wrappers
+from models.toolbank.lora import MultiLoRAConv2d, MultiLoRALinear
 
 # --------------------------------------------------
 # Utils
@@ -109,40 +112,30 @@ class PairedTransform:
 
 
 # --------------------------------------------------
-# Oracle Action
+# Oracle Action (NO HYBRID)
 # --------------------------------------------------
-def choose_oracle_action(
-    degs: List[str],
-    p_hybrid_when_multi: float = 0.7,
-    p_force_desnow_in_multi: float = 0.3,
-) -> str:
+def choose_oracle_action_single(degs: List[str]) -> str:
+    """
+    NO HYBRID policy:
+      - if multiple degs exist, pick one (priority or random).
+    """
     d = [x.lower() for x in degs]
     s = set(d)
 
-    cand = []
+    # priority example (you can change):
     if "drop" in s:
-        cand.append(A_DEDROP)
+        return A_DEDROP
     if "rain" in s:
-        cand.append(A_DERAIN)
+        return A_DERAIN
     if "haze" in s:
-        cand.append(A_DEHAZE)
+        return A_DEHAZE
     if "snow" in s:
-        cand.append(A_DESNOW)
-    if "blur" in s:
-        cand.append(A_DEBLUR)
-
-    if len(cand) == 0:
-        return A_HYBRID
-    if len(cand) == 1:
-        return cand[0]
-
-    if random.random() < float(p_hybrid_when_multi):
-        return A_HYBRID
-
-    if (A_DESNOW in cand) and (random.random() < float(p_force_desnow_in_multi)):
         return A_DESNOW
+    if "blur" in s:
+        return A_DEBLUR
 
-    return random.choice(cand)
+    # fallback
+    return A_DEBLUR
 
 
 # --------------------------------------------------
@@ -157,39 +150,88 @@ def react_ir_collate_fn(batch):
 
 
 # --------------------------------------------------
-# LoRA Param Collection (DEDUP)
+# MultiLoRA Param Collection (ONLY LoRA adapters, NOT base)
 # --------------------------------------------------
-def collect_lora_params(model: nn.Module):
-    params = []
+def collect_multilora_params(toolbank: ToolBank, actions: List[str]) -> List[torch.nn.Parameter]:
+    """
+    Collect ONLY adapter params (A/B) for given actions from MultiLoRA wrappers.
+    IMPORTANT: do NOT include base.* params.
+    """
+    params: List[torch.nn.Parameter] = []
     seen = set()
-    for name, p in model.named_parameters():
-        # LoRAConv2d 내부의 base.weight는 제외하고, lora_A/lora_B만 학습
-        if (".lora_A." in name) or (".lora_B." in name):
-            if id(p) not in seen:
-                p.requires_grad = True
-                params.append(p)
-                seen.add(id(p))
-        else:
-            # 혹시라도 base가 풀렸으면 다시 잠그기(보험)
-            if ".base." in name:
-                p.requires_grad = False
+
+    for _, m in toolbank.backbone.named_modules():
+        if isinstance(m, MultiLoRAConv2d):
+            for a in actions:
+                if a in m.lora_A:
+                    for p in m.lora_A[a].parameters():
+                        if id(p) not in seen:
+                            p.requires_grad = True
+                            params.append(p)
+                            seen.add(id(p))
+                if a in m.lora_B:
+                    for p in m.lora_B[a].parameters():
+                        if id(p) not in seen:
+                            p.requires_grad = True
+                            params.append(p)
+                            seen.add(id(p))
+
+        elif isinstance(m, MultiLoRALinear):
+            for a in actions:
+                if a in m.lora_A:
+                    for p in m.lora_A[a].parameters():
+                        if id(p) not in seen:
+                            p.requires_grad = True
+                            params.append(p)
+                            seen.add(id(p))
+                if a in m.lora_B:
+                    for p in m.lora_B[a].parameters():
+                        if id(p) not in seen:
+                            p.requires_grad = True
+                            params.append(p)
+                            seen.add(id(p))
+
     return params
 
 
 # --------------------------------------------------
 # Action param cache (authoritative)
 # --------------------------------------------------
-def build_action_param_cache(toolbank: ToolBank) -> Dict[str, List[torch.nn.Parameter]]:
+def build_action_param_cache_multilora(
+    toolbank: ToolBank, actions: List[str]
+) -> Dict[str, List[torch.nn.Parameter]]:
+    """
+    cache[action] = list of LoRA adapter params (A/B) that belong to that action.
+    This MUST be disjoint across actions for "independent params" goal.
+    """
     cache: Dict[str, List[torch.nn.Parameter]] = {}
-    for action, modules in toolbank.adapters.items():
-        params = []
-        seen = set()
-        for m in modules:
-            for p in m.parameters():
-                if id(p) not in seen:
-                    params.append(p)
-                    seen.add(id(p))
-        cache[action] = params
+    for a in actions:
+        cache[a] = []
+
+    for _, m in toolbank.backbone.named_modules():
+        if isinstance(m, MultiLoRAConv2d):
+            for a in actions:
+                if a in m.lora_A:
+                    cache[a].extend(list(m.lora_A[a].parameters()))
+                if a in m.lora_B:
+                    cache[a].extend(list(m.lora_B[a].parameters()))
+
+        elif isinstance(m, MultiLoRALinear):
+            for a in actions:
+                if a in m.lora_A:
+                    cache[a].extend(list(m.lora_A[a].parameters()))
+                if a in m.lora_B:
+                    cache[a].extend(list(m.lora_B[a].parameters()))
+
+    # dedup inside each action
+    for a in actions:
+        uniq, seen = [], set()
+        for p in cache[a]:
+            if id(p) not in seen:
+                uniq.append(p)
+                seen.add(id(p))
+        cache[a] = uniq
+
     return cache
 
 
@@ -266,127 +308,95 @@ def silence_delta_theta_loss_mean(
 
 
 # --------------------------------------------------
-# DIAG A) optimizer param coverage / id match
+# DIAG 0) optimizer param coverage check (ONCE)
 # --------------------------------------------------
-def _build_param_owner_name_map(model: nn.Module) -> Dict[int, str]:
-    """
-    id(param) -> "module_name.param_name" mapping for readable debugging.
-    """
-    m = {}
-    for mod_name, mod in model.named_modules():
-        for pn, p in mod.named_parameters(recurse=False):
-            m[id(p)] = f"{mod_name}.{pn}" if mod_name else pn
-    return m
-
-
-def diag_optimizer_lora_coverage_once(
-    toolbank: nn.Module,
+def diag_optimizer_coverage_once(
+    toolbank: ToolBank,
     trainable_lora: List[torch.nn.Parameter],
     optimizer: torch.optim.Optimizer,
     action_param_cache: Dict[str, List[torch.nn.Parameter]],
-    k_print: int = 5,
+    sample_k: int = 5,
 ):
-    # 1) counts
-    opt_ids = set()
-    opt_param_cnt = 0
-    for gi, g in enumerate(optimizer.param_groups):
-        ps = g.get("params", [])
-        opt_param_cnt += len(ps)
-        for p in ps:
-            opt_ids.add(id(p))
-
-    lora_ids = {id(p) for p in trainable_lora}
-
-    cache_ids = set()
-    for a, ps in action_param_cache.items():
-        for p in ps:
-            cache_ids.add(id(p))
-
-    # 2) id set relations
-    lora_not_in_opt = sorted(list(lora_ids - opt_ids))
-    cache_not_in_opt = sorted(list(cache_ids - opt_ids))
-    lora_not_in_cache = sorted(list(lora_ids - cache_ids))
-    cache_not_in_lora = sorted(list(cache_ids - lora_ids))
-
-    # 3) printable names
-    name_map = _build_param_owner_name_map(toolbank)
-
-    def _fmt(pid: int) -> str:
-        return name_map.get(pid, "<unknown>")
-
     print("\n" + "-" * 78)
     print("[DIAG][OPT] optimizer param coverage check (ONCE)")
+
+    # optimizer param ids
+    opt_params = []
+    for g in optimizer.param_groups:
+        opt_params.extend(list(g["params"]))
+    opt_ids = set(id(p) for p in opt_params)
+
+    tl_ids = set(id(p) for p in trainable_lora)
+
+    cache_all = []
+    for _, ps in action_param_cache.items():
+        cache_all.extend(ps)
+    cache_ids = set(id(p) for p in cache_all)
+
     print(f"[DIAG][OPT] len(trainable_lora) = {len(trainable_lora)}")
     print(f"[DIAG][OPT] optimizer.param_groups = {len(optimizer.param_groups)}")
-    print(f"[DIAG][OPT] optimizer total param count (sum of groups) = {opt_param_cnt}")
+    print(f"[DIAG][OPT] optimizer total param count (sum of groups) = {len(opt_params)}")
     print(f"[DIAG][OPT] unique ids in optimizer = {len(opt_ids)}")
-    print(f"[DIAG][OPT] unique ids in trainable_lora = {len(lora_ids)}")
+    print(f"[DIAG][OPT] unique ids in trainable_lora = {len(tl_ids)}")
     print(f"[DIAG][OPT] unique ids in action_param_cache(all) = {len(cache_ids)}")
 
-    print(f"[DIAG][OPT] trainable_lora NOT in optimizer = {len(lora_not_in_opt)}")
-    if len(lora_not_in_opt) > 0:
-        for pid in lora_not_in_opt[: min(k_print, len(lora_not_in_opt))]:
-            print(f"  - missing(lora->opt): id={pid} name={_fmt(pid)}")
+    # set diffs
+    not_in_opt = [p for p in trainable_lora if id(p) not in opt_ids]
+    cache_not_in_opt = [p for p in cache_all if id(p) not in opt_ids]
+    tl_not_in_cache = [p for p in trainable_lora if id(p) not in cache_ids]
+    cache_not_in_tl = [p for p in cache_all if id(p) not in tl_ids]
 
+    print(f"[DIAG][OPT] trainable_lora NOT in optimizer = {len(not_in_opt)}")
     print(f"[DIAG][OPT] action_param_cache params NOT in optimizer = {len(cache_not_in_opt)}")
-    if len(cache_not_in_opt) > 0:
-        for pid in cache_not_in_opt[: min(k_print, len(cache_not_in_opt))]:
-            print(f"  - missing(cache->opt): id={pid} name={_fmt(pid)}")
+    print(f"[DIAG][OPT] trainable_lora NOT in action_param_cache = {len(tl_not_in_cache)}")
+    print(f"[DIAG][OPT] action_param_cache NOT in trainable_lora = {len(cache_not_in_tl)}")
 
-    print(f"[DIAG][OPT] trainable_lora NOT in action_param_cache = {len(lora_not_in_cache)}")
-    if len(lora_not_in_cache) > 0:
-        for pid in lora_not_in_cache[: min(k_print, len(lora_not_in_cache))]:
-            print(f"  - mismatch(lora not in cache): id={pid} name={_fmt(pid)}")
+    # build param -> name mapping (from named_parameters)
+    name_of: Dict[int, str] = {}
+    for n, p in toolbank.named_parameters():
+        name_of[id(p)] = n
 
-    print(f"[DIAG][OPT] action_param_cache NOT in trainable_lora = {len(cache_not_in_lora)}")
-    if len(cache_not_in_lora) > 0:
-        for pid in cache_not_in_lora[: min(k_print, len(cache_not_in_lora))]:
-            print(f"  - mismatch(cache not in lora): id={pid} name={_fmt(pid)}")
-
-    # 4) sample 5 params from trainable_lora
-    print(f"[DIAG][OPT] sample {min(k_print, len(trainable_lora))} params from trainable_lora:")
-    for p in trainable_lora[: min(k_print, len(trainable_lora))]:
-        pid = id(p)
-        nm = name_map.get(pid, "<unknown>")
+    # sample K
+    k = min(sample_k, len(trainable_lora))
+    idxs = random.sample(range(len(trainable_lora)), k=k) if k > 0 else []
+    print(f"[DIAG][OPT] sample {k} params from trainable_lora:")
+    for i in idxs:
+        p = trainable_lora[i]
+        nm = name_of.get(id(p), "<unnamed>")
         print(
-            f"  - name={nm} id={pid} requires_grad={bool(p.requires_grad)} "
-            f"dtype={str(p.dtype)} device={str(p.device)}"
+            f"  - name={nm} id={id(p)} requires_grad={p.requires_grad} "
+            f"dtype={p.dtype} device={p.device}"
         )
+
+    # extra: ensure none of base weights are included
+    base_like = [n for n, p in toolbank.named_parameters() if ("base." in n and id(p) in tl_ids)]
+    if len(base_like) > 0:
+        print("[DIAG][OPT][WARN] base.* params found inside trainable_lora (should be 0):")
+        for n in base_like[:20]:
+            print("  -", n)
+    else:
+        print("[DIAG][OPT] base.* params in trainable_lora = 0 (OK)")
+
     print("-" * 78 + "\n")
 
 
 # --------------------------------------------------
-# DIAG 1) scan backbone LoRA module states
+# DIAG 1) scan current_action/scale/active
 # --------------------------------------------------
-def diag_scan_lora_modules(backbone: nn.Module, limit: int = 8) -> str:
-    """
-    backbone 안의 LoRA 관련 모듈을 스캔해서,
-    enable/scale/active_adapter 같은 상태가 실제로 바뀌는지 확인용 문자열 리턴.
-    (프로젝트마다 속성명이 다를 수 있어 '있는 것만' 출력)
-    """
+def diag_scan_multilora_modules(backbone: nn.Module, limit: int = 8) -> str:
     lines = []
     cnt = 0
     for name, m in backbone.named_modules():
-        if hasattr(m, "is_lora") and bool(getattr(m, "is_lora")):
-            fields = {}
-            for k in [
-                "enabled", "enable", "active", "active_adapter", "current_action",
-                "scale", "scaling", "alpha", "rank", "merged"
-            ]:
-                if hasattr(m, k):
-                    v = getattr(m, k)
-                    try:
-                        if torch.is_tensor(v):
-                            v = float(v.detach().cpu().item())
-                    except Exception:
-                        pass
-                    fields[k] = v
-            lines.append(f"[LoRA] {name} :: {fields}")
+        if isinstance(m, (MultiLoRAConv2d, MultiLoRALinear)):
+            cur = getattr(m, "current_action", None)
+            s = float(m.scale.detach().cpu().item()) if hasattr(m, "scale") else None
+            act = bool(getattr(m, "active", False))
+            lines.append(f"[MultiLoRA] {name} :: current_action={cur} scale={s} active={act}")
             cnt += 1
             if cnt >= limit:
                 break
     if cnt == 0:
-        return "[LoRA] No modules found with attribute is_lora=True in backbone."
+        return "[MultiLoRA] No MultiLoRA wrappers found."
     return "\n".join(lines)
 
 
@@ -407,117 +417,18 @@ def diag_pick_params(
     return picks
 
 
-def diag_param_stats(p: torch.nn.Parameter):
-    with torch.no_grad():
-        w = p.detach()
-        return float(w.float().norm().item()), float(w.float().abs().max().item())
-
-
 # --------------------------------------------------
-# ActionGate
-# --------------------------------------------------
-class ActionGate(nn.Module):
-    def __init__(
-        self,
-        actions: List[str],
-        init: float = 0.9,
-        clamp_min: float = 0.0,
-        clamp_max: float = 1.0,
-        eps: float = 1e-4,
-    ):
-        super().__init__()
-        self.actions = list(actions)
-        self.clamp_min = float(clamp_min)
-        self.clamp_max = float(clamp_max)
-        self.eps = float(eps)
-
-        self.logits = nn.ParameterDict()
-
-        init = float(init)
-        init = float(np.clip(init, self.eps, 1.0 - self.eps))
-        init_logit = float(np.log(init / (1.0 - init)))
-
-        for a in self.actions:
-            self.logits[a] = nn.Parameter(torch.tensor(init_logit, dtype=torch.float32))
-
-    def get_gate(self, action: str, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        if action not in self.logits:
-            base = torch.tensor(1.0, device=device, dtype=dtype)
-        else:
-            base = torch.sigmoid(self.logits[action].to(device=device, dtype=dtype))
-        g = self.clamp_min + (self.clamp_max - self.clamp_min) * base
-        return g
-
-
-class ToolBankWithActionGate(ToolBank):
-    """
-    apply(x, action) = stop_out + gate(action) * (act_out - stop_out)
-    """
-
-    def __init__(
-        self,
-        backbone: nn.Module,
-        adapter_specs: Dict[str, AdapterSpec],
-        device,
-        debug: bool = False,
-        gate_actions: List[str] = None,
-        gate_init: float = 0.9,
-        gate_clamp: Tuple[float, float] = (0.0, 1.0),
-    ):
-        super().__init__(backbone, adapter_specs, device=device, debug=debug)
-        if gate_actions is None:
-            gate_actions = [A_DEDROP, A_DEBLUR, A_DERAIN, A_DESNOW, A_DEHAZE, A_HYBRID]
-        self.action_gate = ActionGate(
-            actions=gate_actions,
-            init=gate_init,
-            clamp_min=float(gate_clamp[0]),
-            clamp_max=float(gate_clamp[1]),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.backbone(x)
-
-    def _tb_forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.forward(x)
-
-    def apply(self, x: torch.Tensor, action: str):
-        # base (STOP) - no grad needed
-        self.activate_adapter(A_STOP)
-        with torch.no_grad():
-            out_base = self._tb_forward(x)
-
-        if action == A_STOP:
-            return out_base
-
-        # action output (grad flows into LoRA + gate)
-        self.activate_adapter(action)
-        out_act = self._tb_forward(x)
-
-        g = self.action_gate.get_gate(action, device=out_act.device, dtype=out_act.dtype)
-        out = out_base + g * (out_act - out_base)
-        return out
-
-    def get_gate_value(self, action: str) -> float:
-        with torch.no_grad():
-            if action not in self.action_gate.logits:
-                return 1.0
-            v = float(torch.sigmoid(self.action_gate.logits[action]).detach().cpu().item())
-            gv = self.action_gate.clamp_min + (self.action_gate.clamp_max - self.action_gate.clamp_min) * v
-            return float(np.clip(gv, self.action_gate.clamp_min, self.action_gate.clamp_max))
-
-
-# --------------------------------------------------
-# DIAG delta stats: mean/max/rms (eps 제거: 0이면 0)
+# DIAG delta stats: mean/max/rms (vs STOP)
 # --------------------------------------------------
 @torch.no_grad()
-def output_delta_stats_vs_stop(toolbank: ToolBankWithActionGate, x: torch.Tensor, action: str) -> Dict[str, float]:
+def output_delta_stats_vs_stop(toolbank: ToolBank, x: torch.Tensor, action: str) -> Dict[str, float]:
     x1 = x[:1]
     out_stop = toolbank.apply(x1, A_STOP)
     out_act = toolbank.apply(x1, action)
     delta = (out_act - out_stop).float()
     mean_abs = float(delta.abs().mean().item())
     max_abs = float(delta.abs().max().item())
-    rms = float(torch.sqrt(torch.mean(delta * delta)).item())  # NOTE: eps 더하지 않음
+    rms = float(torch.sqrt(torch.mean(delta * delta)).item())
     return {"mean_abs": mean_abs, "max_abs": max_abs, "rms": rms}
 
 
@@ -537,8 +448,6 @@ def build_single_dataset(root, cfg, tfm):
         return Rain100Dataset(root=root, split=split, transform=tfm, debug=False)
     if t == "RESIDE6KDataset":
         return RESIDE6KDataset(root=root, split=split, transform=tfm, debug=False)
-    if t == "RESIDE6KDataset":
-        return RESIDE6KDataset(root=root, split=split, transform=tfm, debug=False)
     raise ValueError(t)
 
 
@@ -556,13 +465,19 @@ def build_mixed_dataset(cfg, tfm):
 
 
 # --------------------------------------------------
-# Action helpers
+# Action helpers (NO HYBRID)
 # --------------------------------------------------
 def build_cycle_actions(cfg_tools: dict) -> List[str]:
     cyc = cfg_tools.get("train", {}).get("balance_cycle", None)
     if cyc is None:
-        return [A_DEDROP, A_DEBLUR, A_DERAIN, A_DESNOW, A_DEHAZE, A_HYBRID]
-    return list(cyc)
+        return [A_DEDROP, A_DEBLUR, A_DERAIN, A_DESNOW, A_DEHAZE]
+    # enforce no-hybrid
+    out = []
+    for a in list(cyc):
+        if a == "A_HYBRID":
+            continue
+        out.append(a)
+    return out
 
 
 # --------------------------------------------------
@@ -580,7 +495,6 @@ def main():
     diff_every = int(cfg_tools.get("train", {}).get("diff_every", 500))
     log_every = int(cfg_tools.get("train", {}).get("log_every", 50))
 
-    # diag_steps: 강제 DIAG(=sanity+diff+추가 상태 출력) 찍는 step 리스트
     diag_steps = cfg_tools.get("train", {}).get("diag_steps", [20, 40])
     if not isinstance(diag_steps, list) or len(diag_steps) == 0:
         diag_steps = [20, 40]
@@ -588,20 +502,12 @@ def main():
     diag_step_set = set(diag_steps)
     print(f"[Diag] diag_steps={diag_steps}")
 
-    p_hybrid_when_multi = float(cfg_tools.get("train", {}).get("p_hybrid_when_multi", 0.7))
-    p_force_desnow_in_multi = float(cfg_tools.get("train", {}).get("p_force_desnow_in_multi", 0.3))
-
     balance_cycle = build_cycle_actions(cfg_tools)
+    actions_all = [A_DEDROP, A_DEBLUR, A_DERAIN, A_DESNOW, A_DEHAZE]
 
     lambda_silence = float(cfg_tools.get("train", {}).get("lambda_silence", 0.0))
     silence_warmup_steps = int(cfg_tools.get("train", {}).get("silence_warmup_steps", 0))
     silence_every = int(cfg_tools.get("train", {}).get("silence_every", 1))
-
-    gate_cfg = cfg_tools.get("train", {}).get("action_gate", {}) if isinstance(cfg_tools.get("train", {}), dict) else {}
-    gate_init = float(gate_cfg.get("init", 0.9))
-    gate_clamp_min = float(gate_cfg.get("clamp_min", 0.0))
-    gate_clamp_max = float(gate_cfg.get("clamp_max", 1.0))
-    gate_lr_scale = float(gate_cfg.get("lr_scale", 1.0))
 
     amp_cfg = cfg_tools.get("train", {}).get("amp_cfg", {}) if isinstance(cfg_tools.get("train", {}), dict) else {}
     scaler_init_scale = float(amp_cfg.get("init_scale", 2**12))
@@ -630,60 +536,55 @@ def main():
 
     # Model
     backbone = VETNet(dim=48, volterra_rank=4).to(device)
-    adapter_specs = {a: AdapterSpec(**s) for a, s in cfg_tools["toolbank"]["adapters"].items()}
 
-    # ToolBank + ActionGate
-    toolbank = ToolBankWithActionGate(
-        backbone,
-        adapter_specs,
+    # toolbank specs (NO HYBRID)
+    raw_specs = cfg_tools["toolbank"]["adapters"]
+    adapter_specs: Dict[str, AdapterSpec] = {}
+    for a in actions_all:
+        s = raw_specs.get(a, {})
+        adapter_specs[a] = AdapterSpec(**s)
+
+    toolbank = ToolBank(
+        backbone=backbone,
+        adapter_specs=adapter_specs,
         device=device,
         debug=True,
-        gate_actions=[A_DEDROP, A_DEBLUR, A_DERAIN, A_DESNOW, A_DEHAZE, A_HYBRID],
-        gate_init=gate_init,
-        gate_clamp=(gate_clamp_min, gate_clamp_max),
     ).to(device)
 
-    # Freeze backbone (LoRA만 학습)
+    # freeze backbone base weights
     if bool(cfg_tools.get("toolbank", {}).get("freeze_backbone", True)):
         for p in toolbank.backbone.parameters():
             p.requires_grad = False
 
-    # Trainables: LoRA + ActionGate params
-    trainable_lora = collect_lora_params(toolbank)
-    trainable_gate = list(toolbank.action_gate.parameters())
-    for p in trainable_gate:
-        p.requires_grad = True
-
+    # Trainables: ONLY MultiLoRA adapters for all actions
+    trainable_lora = collect_multilora_params(toolbank, actions_all)
     lora_numel = sum(p.numel() for p in trainable_lora)
-    gate_numel = sum(p.numel() for p in trainable_gate)
     print(f"[Trainable LoRA] {lora_numel/1e6:.2f} M params ({lora_numel} params)")
-    print(f"[Trainable Gate] {gate_numel} params")
 
-    # Optimizer (param groups so gate can have separate lr if needed)
-    param_groups = [{"params": trainable_lora, "lr": lr}]
-    if len(trainable_gate) > 0:
-        param_groups.append({"params": trainable_gate, "lr": lr * gate_lr_scale})
-
-    optimizer = torch.optim.AdamW(param_groups, lr=lr, betas=betas, weight_decay=weight_decay)
+    optimizer = torch.optim.AdamW(
+        [{"params": trainable_lora, "lr": lr}],
+        lr=lr,
+        betas=betas,
+        weight_decay=weight_decay,
+    )
     scaler = GradScaler("cuda", init_scale=scaler_init_scale, growth_interval=scaler_growth_interval) if use_amp else None
 
     # Action param cache + θ0 snapshot
-    action_param_cache = build_action_param_cache(toolbank)
+    action_param_cache = build_action_param_cache_multilora(toolbank, actions_all)
     theta0_snapshot = build_action_theta0_snapshot_fp16(action_param_cache)
     print("[SilenceΔθ] snapshot(theta0) captured (fp16, cpu).")
 
-    # DIAG A) optimizer coverage check (ONCE at init)
-    diag_optimizer_lora_coverage_once(
+    # OPT coverage check (ONCE)
+    diag_optimizer_coverage_once(
         toolbank=toolbank,
         trainable_lora=trainable_lora,
         optimizer=optimizer,
         action_param_cache=action_param_cache,
-        k_print=5,
+        sample_k=5,
     )
 
-    # DIAG 2) pick params + snapshot (per-action 1개씩)
-    diag_actions = [A_DEDROP, A_DEBLUR, A_DERAIN, A_DESNOW, A_DEHAZE, A_HYBRID]
-    diag_picks = diag_pick_params(action_param_cache, diag_actions, k_per_action=1)
+    # DIAG pick params (per-action 1개씩)
+    diag_picks = diag_pick_params(action_param_cache, actions_all, k_per_action=1)
     diag_snap: Dict[str, List[torch.Tensor]] = {}
     for a, ps in diag_picks.items():
         diag_snap[a] = [p.detach().clone().to("cpu", dtype=torch.float32) for p in ps]
@@ -692,14 +593,11 @@ def main():
     # Training cfg
     save_dir = cfg_tools["paths"]["ckpt_dir"]
     os.makedirs(save_dir, exist_ok=True)
-
     epochs = int(cfg_tools["train"]["epochs"])
 
     print(f"[Train] batch_size={cfg_ds['loader']['batch_size']} epochs={epochs} lr={lr} seed={cfg_ds.get('mixed', {}).get('seed', 123)}")
-    print(f"[OraclePolicy] p_hybrid_when_multi={p_hybrid_when_multi} p_force_desnow_in_multi={p_force_desnow_in_multi}")
     print(f"[ActionBalance] cycle={balance_cycle}")
     print(f"[SilenceΔθ] lambda_silence={lambda_silence} warmup={silence_warmup_steps} every={silence_every}")
-    print(f"[ActionGate] init={gate_init} clamp=[{gate_clamp_min},{gate_clamp_max}] lr_scale={gate_lr_scale}")
     print(f"[AMP] use_amp={use_amp} scaler_init_scale={scaler_init_scale} growth_interval={scaler_growth_interval}")
     print(f"[Sanity] sanity_every={sanity_every} diff_every={diff_every} log_every={log_every}")
 
@@ -710,14 +608,11 @@ def main():
     action_count: DefaultDict[str, int] = defaultdict(int)
     action_seen: DefaultDict[str, int] = defaultdict(int)
 
-    prev_action: str = A_STOP
     t0 = time.time()
-
     steps_per_epoch = len(loader)
     print(f"[Train] steps_per_epoch={steps_per_epoch} (MixedDataset.__len__)")
 
     cycle_idx = 0
-    sanity_actions = [A_DEDROP, A_DEBLUR, A_DERAIN, A_DESNOW, A_DEHAZE, A_HYBRID]
 
     for epoch in range(epochs):
         total = 0.0
@@ -732,14 +627,7 @@ def main():
             x = batch["input"].to(device, non_blocking=True)
             gt = batch["gt"].to(device, non_blocking=True)
 
-            oracle_actions = [
-                choose_oracle_action(
-                    m["degradations"],
-                    p_hybrid_when_multi=p_hybrid_when_multi,
-                    p_force_desnow_in_multi=p_force_desnow_in_multi,
-                )
-                for m in batch["meta"]
-            ]
+            oracle_actions = [choose_oracle_action_single(m["degradations"]) for m in batch["meta"]]
             oracle_major = max(set(oracle_actions), key=oracle_actions.count)
 
             action = balance_cycle[cycle_idx % len(balance_cycle)]
@@ -761,11 +649,11 @@ def main():
             if use_amp:
                 with autocast(device_type="cuda"):
                     pred = toolbank.apply(x, action)
-                loss_rec = charbonnier_loss(pred.float(), gt.float())
-                loss = loss_rec
-                if use_silence:
-                    l_sil = silence_delta_theta_loss_mean(action_param_cache, theta0_snapshot, action)
-                    loss = loss + (loss_rec.new_tensor(lambda_silence) * l_sil)
+                    loss_rec = charbonnier_loss(pred.float(), gt.float())
+                    loss = loss_rec
+                    if use_silence:
+                        l_sil = silence_delta_theta_loss_mean(action_param_cache, theta0_snapshot, action)
+                        loss = loss + (loss_rec.new_tensor(lambda_silence) * l_sil)
             else:
                 pred = toolbank.apply(x, action)
                 loss_rec = charbonnier_loss(pred, gt)
@@ -792,18 +680,18 @@ def main():
             if grad_clip > 0:
                 if use_amp:
                     ensure_unscale()
-                torch.nn.utils.clip_grad_norm_(list(trainable_lora) + list(trainable_gate), grad_clip)
+                torch.nn.utils.clip_grad_norm_(trainable_lora, grad_clip)
 
             # Decide diag/sanity/diff
             force_diag = (global_step in diag_step_set)
             do_sanity = (sanity_every > 0 and (global_step % sanity_every == 0))
             do_diff = (diff_every > 0 and (global_step % diff_every == 0))
 
-            # DIAG 1) LoRA state scan BEFORE optimizer step
+            # DIAG 1) wrapper states BEFORE optimizer step
             if force_diag:
-                print(f"[DIAG][lora_state][pre_step] step={global_step} action={action}\n{diag_scan_lora_modules(toolbank.backbone, limit=6)}")
+                print(f"[DIAG][multilora_state][pre_step] step={global_step} action={action}\n{diag_scan_multilora_modules(toolbank.backbone, limit=6)}")
 
-            # SANITY grad stats (after backward; before step)
+            # SANITY grad stats
             if force_diag or do_sanity:
                 tag = "DIAG" if force_diag else "SANITY"
                 if use_amp:
@@ -813,6 +701,12 @@ def main():
                         pass
                     ensure_unscale()
 
+                # grad selectivity
+                g_sel = grad_norm_for_action_params(action_param_cache, action)
+                g_non = grad_norm_sum_except_params(action_param_cache, action, actions_all)
+                ratio = g_sel / (g_non + 1e-12)
+
+                # max grad
                 max_g = 0.0
                 cnt = 0
                 for p in trainable_lora:
@@ -822,14 +716,9 @@ def main():
 
                 print(f"[{tag}][grad_cnt] step={global_step} cnt={cnt}/{len(trainable_lora)}")
                 print(f"[{tag}][grad_max] step={global_step} max_abs_grad={max_g:.3e}")
-
-                g_sel = grad_norm_for_action_params(action_param_cache, action)
-                g_non = grad_norm_sum_except_params(action_param_cache, action, sanity_actions)
-                ratio = g_sel / (g_non + 1e-12)
-                gate_val_now = toolbank.get_gate_value(action)
                 print(
-                    f"[{tag}][grad] step={global_step} sel={action} "
-                    f"g_sel={g_sel:.3e} sum_g_non_sel={g_non:.3e} ratio={ratio:.3e} gate={gate_val_now:.3f}"
+                    f"[{tag}][grad_sel] step={global_step} sel={action} "
+                    f"g_sel={g_sel:.3e} sum_g_non_sel={g_non:.3e} ratio={ratio:.3e}"
                 )
 
             # Optimizer step
@@ -855,7 +744,7 @@ def main():
                         )
                         diag_snap[a][i] = w1.clone()
 
-            # DIAG/SANITY diff: Δout_vs_stop(mean/max/rms)
+            # DIAG/SANITY diff: Δout_vs_stop
             if force_diag or do_diff:
                 toolbank.eval()
                 with torch.no_grad():
@@ -878,16 +767,11 @@ def main():
             action_seen[action] += 1
 
             elapsed = time.time() - t0
-            sw_flag = 1 if (prev_action != A_STOP and action != prev_action) else 0
-            gate_val = toolbank.get_gate_value(action)
-
             pbar.set_postfix(
                 {
                     "loss": f"{avg_loss:.4f}",
                     "act": action,
                     "m": f"{mismatch_rate:.2f}",
-                    "sw": f"{sw_flag:d}",
-                    "gate": f"{gate_val:.2f}",
                     "min": f"{elapsed/60:.1f}",
                 },
                 refresh=False,
@@ -897,10 +781,8 @@ def main():
                 tqdm.write(
                     f"[BATCH][debug] epoch={epoch+1}/{epochs} it={it}/{steps_per_epoch} step={global_step} "
                     f"target={action} oracle_major={oracle_major} mismatch={mismatch}/{len(oracle_actions)} "
-                    f"ok={(oracle_major==action)} gate={gate_val:.3f} oracle_hist={dict(oracle_hist)}"
+                    f"ok={(oracle_major==action)} oracle_hist={dict(oracle_hist)}"
                 )
-
-            prev_action = action
 
         # Epoch checkpoint
         epoch_loss = total / max(1, steps_per_epoch)
@@ -918,16 +800,15 @@ def main():
 
         # Epoch summary
         print(f"[Epoch {epoch+1}] Action-wise mean loss:")
-        for a in sanity_actions:
+        for a in actions_all:
             c = action_count.get(a, 0)
-            gv = toolbank.get_gate_value(a)
             if c > 0:
                 m = action_loss_sum[a] / c
-                print(f"  - {a:<8} : count={c:5d} mean_loss={m:.4f} gate={gv:.3f}")
+                print(f"  - {a:<8} : count={c:5d} mean_loss={m:.4f}")
             else:
-                print(f"  - {a:<8} : count=    0 mean_loss=NA gate={gv:.3f}")
+                print(f"  - {a:<8} : count=    0 mean_loss=NA")
 
-        print("[Seen so far]", {a: action_seen.get(a, 0) for a in sanity_actions})
+        print("[Seen so far]", {a: action_seen.get(a, 0) for a in actions_all})
 
     print("[Train] Done ✅")
 
