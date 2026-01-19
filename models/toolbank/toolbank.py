@@ -1,13 +1,11 @@
-# E:\ReAct-IR\models\toolbank\toolbank.py
+# models/toolbank/toolbank.py
 import os
 import sys
-import inspect
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 # ------------------------------------------------------------
 # Ensure project root (E:/ReAct-IR) is in sys.path
@@ -19,16 +17,16 @@ if PROJECT_ROOT not in sys.path:
 
 from models.backbone.vetnet import VETNet
 from models.planner.action_space import (
-    A_DEDROP, A_DEBLUR, A_DERAIN, A_DESNOW,
-    A_DEHAZE, A_HYBRID, A_STOP
+    A_DEDROP, A_DEBLUR, A_DERAIN, A_DESNOW, A_DEHAZE, A_STOP
 )
-from models.toolbank.lora import LoRAConv2d
+from models.toolbank.lora import MultiLoRAConv2d, MultiLoRALinear
 
 
 # --------------------------
 # Action → target patterns
+#   (HYBRID 제거)
 # --------------------------
-def _patterns_for_action(action: str):
+def _patterns_for_action(action: str) -> List[str]:
     if action == A_DEDROP:
         return [".volt1."]
     if action == A_DEBLUR:
@@ -39,8 +37,6 @@ def _patterns_for_action(action: str):
         return [".volt1."]
     if action == A_DEHAZE:
         return [".attn.project_out"]
-    if action == A_HYBRID:
-        return [".attn.project_out", ".volt1."]
     return []
 
 
@@ -50,17 +46,22 @@ class AdapterSpec:
     alpha: float = 1.0
     dropout: float = 0.0
     runtime_scale: float = 1.0
+    init_B_zero: bool = True
+    force_nonzero_init: bool = False
 
 
 class ToolBank(nn.Module):
     """
-    Shared-backbone + action-specific LoRA adapters
+    ToolBank (NO HYBRID)
+      - Shared backbone
+      - Each target layer is wrapped ONCE with MultiLoRA* wrapper
+      - Inside wrapper: action별 LoRA 파라미터가 독립 (A/B가 action마다 별도)
 
-    (Condition-2) Action 전문 경로 강제:
-      - apply() 내부에서 action별 입력 변형을 수행하여,
-        각 action adapter가 '자기 열화에 유리한 관측'을 보도록 유도.
-      - 안전하게: self.training == True 일 때만 변형(훈련 전용),
-        eval/inference에서는 입력을 그대로 통과.
+    Guarantee:
+      - action이 바뀌면 같은 레이어라도 다른 (A,B)를 사용 => 출력이 일관되게 달라짐
+      - "A_DEBLUR만 업데이트 / A_DERAIN은 그대로"가 가능
+        (optimizer param group을 action별로 분리하면 됨)
+      - A_STOP: 전역 LoRA off (모든 MultiLoRA*에서 action=None, scale=0)
     """
 
     def __init__(
@@ -69,30 +70,38 @@ class ToolBank(nn.Module):
         adapter_specs: Optional[Dict[str, AdapterSpec]] = None,
         device: Optional[torch.device] = None,
         debug: bool = True,
+        enable_linear: bool = False,  # VETNet은 대부분 conv; 필요시 True
     ):
         super().__init__()
-        self.debug = debug
+        self.debug = bool(debug)
+        self.enable_linear = bool(enable_linear)
 
         self.backbone = backbone if backbone is not None else VETNet()
         if device is not None:
             self.backbone = self.backbone.to(device)
 
+        # supported actions (NO HYBRID)
+        self.actions: List[str] = [A_DEDROP, A_DEBLUR, A_DERAIN, A_DESNOW, A_DEHAZE]
         self.adapter_specs: Dict[str, AdapterSpec] = adapter_specs or {}
 
-        # ✅ action → LoRA modules
-        self.adapters: Dict[str, List[LoRAConv2d]] = {}
+        # action -> list of MultiLoRA modules that have this action adapter
+        self.adapters: Dict[str, List[nn.Module]] = {a: [] for a in self.actions}
 
-        self._inject_all_actions()
+        # runtime
+        self._active_action: str = "__INIT__"
+
+        # inject wrappers + register which module supports which actions
+        self._inject_multilora_once()
+
+        # global stop at init (real off)
         self.activate_adapter(A_STOP)
 
-    # --------------------------------------------------
-    # Helpers
-    # --------------------------------------------------
-    def _iter_named_conv_or_lora(self):
-        for name, m in self.backbone.named_modules():
-            if isinstance(m, (nn.Conv2d, LoRAConv2d)):
-                yield name, m
+        if self.debug:
+            self._diag_counts()
 
+    # --------------------------------------------------
+    # Injection (one-time)
+    # --------------------------------------------------
     def _set_module_by_name(self, name: str, new_module: nn.Module):
         parts = name.split(".")
         cur = self.backbone
@@ -100,189 +109,227 @@ class ToolBank(nn.Module):
             cur = getattr(cur, p)
         setattr(cur, parts[-1], new_module)
 
-    def _inject_lora_into_conv(self, conv: nn.Conv2d, spec: AdapterSpec) -> LoRAConv2d:
+    def _iter_named_base_layers(self):
         """
-        🔥 DEBUG MODE: force_nonzero_init=True
+        iterate over modules that are candidates to be wrapped.
+        IMPORTANT: named_modules() yields nested; we only wrap if module is Conv2d/Linear AND not already wrapped.
         """
-        lora = LoRAConv2d(
-            conv,
-            r=spec.rank,
-            alpha=spec.alpha,
-            force_nonzero_init=False,  # 🔥 핵심
-        )
-        lora.active = True
-        return lora
-
-    # --------------------------------------------------
-    # Action-input transforms (Condition-2)
-    # --------------------------------------------------
-    @staticmethod
-    def _depthwise_blur3x3(x: torch.Tensor) -> torch.Tensor:
-        """
-        Lightweight 3x3 depthwise Gaussian-ish blur:
-          [[1,2,1],[2,4,2],[1,2,1]] / 16
-        """
-        b, c, h, w = x.shape
-        k = torch.tensor([[1.0, 2.0, 1.0],
-                          [2.0, 4.0, 2.0],
-                          [1.0, 2.0, 1.0]], device=x.device, dtype=x.dtype)
-        k = (k / 16.0).view(1, 1, 3, 3).repeat(c, 1, 1, 1)  # (C,1,3,3)
-        return F.conv2d(x, k, bias=None, stride=1, padding=1, groups=c)
-
-    @staticmethod
-    def _avgpool(x: torch.Tensor, k: int) -> torch.Tensor:
-        pad = k // 2
-        return F.avg_pool2d(x, kernel_size=k, stride=1, padding=pad)
-
-    @staticmethod
-    def _clamp01_if_needed(x: torch.Tensor) -> torch.Tensor:
-        # 데이터가 [0,1] 범위라고 가정하지 않고,
-        # 폭주만 막기 위해 완만하게 clamp를 걸어줌(AMP 안전).
-        # 강한 clamp는 학습을 망칠 수 있어 넉넉히.
-        return torch.clamp(x, min=-2.0, max=2.0)
-
-    def _action_input_transform(self, x: torch.Tensor, action: str) -> torch.Tensor:
-        """
-        Action별 "전문 경로"를 강제하기 위한 입력 변형.
-        - 훈련 때만 적용 (self.training==True)
-        - eval/infer에서는 입력 그대로 반환
-        """
-        if (not self.training) or (action == A_STOP):
-            return x
-
-        # 공통: AMP/안정성을 위해 dtype/device 유지, 값 폭주만 완만하게 억제
-        # (여기서는 변형 후에만 clamp)
-        if action == A_DEBLUR:
-            # DeBlur: 약한 블러를 더해 "블러 특성"을 강조(전문 경로 유도)
-            y = self._depthwise_blur3x3(x)
-            out = 0.7 * x + 0.3 * y
-
-        elif action == A_DEHAZE:
-            # DeHaze: 저주파(대기광/콘트라스트 저하) 성분을 강조
-            lf = self._avgpool(x, k=15)
-            out = 0.6 * x + 0.4 * lf
-
-        elif action == A_DERAIN:
-            # DeRain: 스트릭/고주파 성분을 강조 (미세 high-pass)
-            lf = self._avgpool(x, k=7)
-            hp = x - lf
-            out = x + 0.5 * hp
-
-        elif action in (A_DEDROP, A_DESNOW):
-            # DeDrop / DeSnow: 국소적인 blob/occlusion 성분을 강조 (좀 더 강한 high-pass)
-            lf = self._avgpool(x, k=11)
-            hp = x - lf
-            out = x + 0.8 * hp
-
-        elif action == A_HYBRID:
-            # Hybrid: 저주파(안개) + 고주파(스트릭/블랍) 둘 다 보이도록 혼합
-            lf = self._avgpool(x, k=15)
-            mf = self._avgpool(x, k=7)
-            hp = x - mf
-            out = 0.55 * x + 0.25 * lf + 0.35 * hp
-
-        else:
-            out = x
-
-        return self._clamp01_if_needed(out)
-
-    # --------------------------------------------------
-    # Injection
-    # --------------------------------------------------
-    def _inject_action(self, action: str):
-        patterns = _patterns_for_action(action)
-        spec = self.adapter_specs.get(action, AdapterSpec())
-        action_loras: List[LoRAConv2d] = []
-
-        for name, module in self._iter_named_conv_or_lora():
-            if not patterns:
+        for name, m in self.backbone.named_modules():
+            if isinstance(m, MultiLoRAConv2d) or isinstance(m, MultiLoRALinear):
                 continue
-            if not any(p in name for p in patterns):
+            if isinstance(m, nn.Conv2d):
+                yield name, m
+            elif self.enable_linear and isinstance(m, nn.Linear):
+                yield name, m
+
+    def _spec_for_action(self, action: str) -> AdapterSpec:
+        return self.adapter_specs.get(action, AdapterSpec())
+
+    def _collect_actions_for_layer_name(self, layer_name: str) -> List[str]:
+        """
+        Which actions should exist inside this wrapper?
+        If multiple actions match patterns, we include all of them => params are still independent.
+        """
+        acts = []
+        for a in self.actions:
+            pats = _patterns_for_action(a)
+            if len(pats) == 0:
+                continue
+            if any(p in layer_name for p in pats):
+                acts.append(a)
+        return acts
+
+    def _inject_multilora_once(self):
+        injected = 0
+
+        # We must be careful: wrapping changes module tree; so we iterate over a snapshot list
+        candidates = list(self._iter_named_base_layers())
+
+        for name, module in candidates:
+            acts = self._collect_actions_for_layer_name(name)
+            if len(acts) == 0:
                 continue
 
-            if isinstance(module, LoRAConv2d):
-                action_loras.append(module)
-                continue
+            # choose "shape hyperparams" from a representative spec:
+            # we allow per-action different rank/alpha, but that would require per-action shapes.
+            # For strict action-independence with different ranks, you'd need a more complex design.
+            # Here: we enforce that all actions that share this layer use the SAME (rank, alpha, dropout) for this layer.
+            # (runtime_scale can still vary per action.)
+            ref = self._spec_for_action(acts[0])
+            for a in acts[1:]:
+                s = self._spec_for_action(a)
+                if (s.rank != ref.rank) or (float(s.alpha) != float(ref.alpha)) or (float(s.dropout) != float(ref.dropout)):
+                    raise ValueError(
+                        f"[ToolBank] Incompatible adapter specs for layer '{name}'. "
+                        f"Actions {acts} must share the same (rank, alpha, dropout) for this layer, "
+                        f"but got mismatch between {acts[0]} and {a}."
+                    )
 
             if isinstance(module, nn.Conv2d):
-                lora = self._inject_lora_into_conv(module, spec)
-                self._set_module_by_name(name, lora)
-                action_loras.append(lora)
+                wrapped = MultiLoRAConv2d(
+                    module,
+                    actions=acts,
+                    r=ref.rank,
+                    alpha=ref.alpha,
+                    dropout=ref.dropout,
+                    init_B_zero=bool(ref.init_B_zero),
+                    force_nonzero_init=bool(ref.force_nonzero_init),
+                )
+            else:
+                wrapped = MultiLoRALinear(
+                    module,
+                    actions=acts,
+                    r=ref.rank,
+                    alpha=ref.alpha,
+                    dropout=ref.dropout,
+                    init_B_zero=bool(ref.init_B_zero),
+                    force_nonzero_init=bool(ref.force_nonzero_init),
+                )
 
-        # deduplicate
-        uniq, seen = [], set()
-        for m in action_loras:
-            if id(m) not in seen:
-                uniq.append(m)
-                seen.add(id(m))
+            self._set_module_by_name(name, wrapped)
+            injected += 1
 
-        self.adapters[action] = uniq
+            # register per-action module list
+            for a in acts:
+                self.adapters[a].append(wrapped)
 
         if self.debug:
-            print(
-                f"[ToolBank] Action={action:<9} "
-                f"Injected/Bound LoRA modules={len(uniq)} (rank={spec.rank})"
-            )
-
-    def _inject_all_actions(self):
-        actions = list(self.adapter_specs.keys())
-        for a in [A_DEDROP, A_DEBLUR, A_DERAIN, A_DESNOW, A_DEHAZE, A_HYBRID]:
-            if a not in actions:
-                actions.append(a)
-        for a in actions:
-            self._inject_action(a)
+            print(f"[ToolBank] MultiLoRA injected wrappers = {injected}")
+            for a in self.actions:
+                print(f"[ToolBank] action={a:<8} modules_with_adapter={len(self.adapters[a])}")
 
     # --------------------------------------------------
-    # Activation
+    # Activation (global, safe)
     # --------------------------------------------------
-    def activate_adapter(self, action: str):
-        for a, modules in self.adapters.items():
-            for m in modules:
+    def _deactivate_all_lora(self):
+        for _, m in self.backbone.named_modules():
+            if isinstance(m, (MultiLoRAConv2d, MultiLoRALinear)):
+                m.set_action(None)
                 m.set_scale(0.0)
-                m.active = False
 
-        if action == A_STOP:
-            if self.debug:
-                print("[ToolBank] A_STOP → all LoRA off (no-op)")
+    def activate_adapter(self, action: str):
+        if action == self._active_action:
             return
 
-        scale = float(self.adapter_specs.get(action, AdapterSpec()).runtime_scale)
-        for m in self.adapters.get(action, []):
-            m.set_scale(scale)
-            m.active = True
+        if action == A_STOP:
+            self._deactivate_all_lora()
+            self._active_action = A_STOP
+            if self.debug:
+                print("[ToolBank] A_STOP → deactivated ALL LoRA adapters")
+            return
+
+        if action not in self.actions:
+            raise KeyError(f"[ToolBank] unknown action: {action}")
+
+        # global set to action, but scale only for modules that have that action adapter;
+        # for others, action is None (off). This guarantees strict separation.
+        # (This also avoids any accidental influence from modules that don't have that action.)
+        for _, m in self.backbone.named_modules():
+            if not isinstance(m, (MultiLoRAConv2d, MultiLoRALinear)):
+                continue
+
+            if action in getattr(m, "actions", []):
+                m.set_action(action)
+                # runtime_scale is action-wise; applied uniformly for this action
+                sc = float(self._spec_for_action(action).runtime_scale)
+                m.set_scale(sc)
+            else:
+                m.set_action(None)
+                m.set_scale(0.0)
+
+        self._active_action = action
 
         if self.debug:
-            print(
-                f"[ToolBank] Activated action={action} "
-                f"| scale={scale} | #modules={len(self.adapters.get(action, []))}"
-            )
+            sc = float(self._spec_for_action(action).runtime_scale)
+            print(f"[ToolBank] Activated action={action} | runtime_scale={sc}")
 
     # --------------------------------------------------
-    # Apply
+    # Params helpers (for “A_DEBLUR만 업데이트” 같은 분리 학습)
     # --------------------------------------------------
+    def get_action_parameters(self, action: str) -> List[torch.nn.Parameter]:
+        """
+        Return ONLY parameters belonging to the given action adapters.
+        (base params are frozen in wrappers; only LoRA params are returned)
+        """
+        if action not in self.actions:
+            raise KeyError(action)
+
+        params: List[torch.nn.Parameter] = []
+        seen = set()
+
+        for m in self.adapters.get(action, []):
+            # MultiLoRA wrappers store per-action adapters in ModuleDict
+            for p in m.lora_A[action].parameters():
+                if id(p) not in seen:
+                    params.append(p)
+                    seen.add(id(p))
+            for p in m.lora_B[action].parameters():
+                if id(p) not in seen:
+                    params.append(p)
+                    seen.add(id(p))
+        return params
+
+    def get_all_lora_parameters(self) -> List[torch.nn.Parameter]:
+        params: List[torch.nn.Parameter] = []
+        seen = set()
+        for _, m in self.backbone.named_modules():
+            if isinstance(m, (MultiLoRAConv2d, MultiLoRALinear)):
+                for a in getattr(m, "actions", []):
+                    for p in m.lora_A[a].parameters():
+                        if id(p) not in seen:
+                            params.append(p)
+                            seen.add(id(p))
+                    for p in m.lora_B[a].parameters():
+                        if id(p) not in seen:
+                            params.append(p)
+                            seen.add(id(p))
+        return params
+
+    # --------------------------------------------------
+    # Forward / Apply
+    # --------------------------------------------------
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.backbone(x)
+
     def apply(self, x: torch.Tensor, action: str) -> torch.Tensor:
         if self.debug:
-            print(f"[DEBUG] apply() using action = {action}")
-
-        if action == A_STOP:
-            self.activate_adapter(A_STOP)
-            return self.backbone(x)   # ✅ backbone은 반드시 통과
-
-        # (Condition-2) action별 입력 변형 (훈련 전용)
-        x_in = self._action_input_transform(x, action)
-
+            print(f"[DEBUG] apply(action={action})")
         self.activate_adapter(action)
-        return self.backbone(x_in)
+        return self.forward(x)
 
+    # --------------------------------------------------
+    # Diagnostics
+    # --------------------------------------------------
+    def _diag_counts(self):
+        total_wrappers = 0
+        total_adapters = 0
+        for _, m in self.backbone.named_modules():
+            if isinstance(m, (MultiLoRAConv2d, MultiLoRALinear)):
+                total_wrappers += 1
+                total_adapters += len(getattr(m, "actions", []))
+        print(f"[ToolBank][Diag] total MultiLoRA wrappers in backbone = {total_wrappers}")
+        print(f"[ToolBank][Diag] total action-adapters across wrappers = {total_adapters}")
+
+    def diag_first_lora_states(self, limit: int = 10) -> List[Tuple[str, Optional[str], float, bool]]:
+        out = []
+        for name, m in self.backbone.named_modules():
+            if isinstance(m, (MultiLoRAConv2d, MultiLoRALinear)):
+                cur = getattr(m, "current_action", None)
+                sc = float(m.scale.detach().cpu().item())
+                act = bool(getattr(m, "active", False))
+                out.append((name, cur, sc, act))
+                if len(out) >= limit:
+                    break
+        return out
 
 
 # --------------------------------------------------
-# Debug main (DIFF TEST)
+# Debug main (NO HYBRID)
 # --------------------------------------------------
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    print("[DEBUG] Initializing VETNet backbone + ToolBank ...")
+    print("[DEBUG] Initializing VETNet backbone + ToolBank (NO HYBRID) ...")
     backbone = VETNet(
         dim=48,
         num_blocks=[4, 6, 6, 8],
@@ -293,33 +340,52 @@ if __name__ == "__main__":
     ).to(device)
     backbone.eval()
 
+    # IMPORTANT:
+    # - For “diff가 0이냐/아니냐” 즉시 확인하려면 force_nonzero_init=True로 두고 테스트.
+    # - 실제 학습용은 보통 init_B_zero=True, force_nonzero_init=False가 안정적.
+    specs = {
+        A_DEDROP: AdapterSpec(rank=2, alpha=1.0, dropout=0.0, runtime_scale=1.0, init_B_zero=True, force_nonzero_init=True),
+        A_DEBLUR: AdapterSpec(rank=2, alpha=1.0, dropout=0.0, runtime_scale=1.0, init_B_zero=True, force_nonzero_init=True),
+        A_DERAIN: AdapterSpec(rank=2, alpha=1.0, dropout=0.0, runtime_scale=1.0, init_B_zero=True, force_nonzero_init=True),
+        A_DESNOW: AdapterSpec(rank=2, alpha=1.0, dropout=0.0, runtime_scale=1.0, init_B_zero=True, force_nonzero_init=True),
+        A_DEHAZE: AdapterSpec(rank=2, alpha=1.0, dropout=0.0, runtime_scale=1.0, init_B_zero=True, force_nonzero_init=True),
+    }
+
     tb = ToolBank(
         backbone=backbone,
-        adapter_specs={
-            A_DEDROP: AdapterSpec(rank=4),
-            A_DEBLUR: AdapterSpec(rank=4),
-            A_DERAIN: AdapterSpec(rank=4),
-            A_DESNOW: AdapterSpec(rank=4),
-            A_DEHAZE: AdapterSpec(rank=4),
-            A_HYBRID: AdapterSpec(rank=2, runtime_scale=0.8),
-        },
+        adapter_specs=specs,
         device=device,
         debug=True,
+        enable_linear=False,
     ).to(device)
     tb.eval()
 
-    x = torch.randn(1, 3, 128, 128).to(device)
+    x = torch.randn(1, 3, 128, 128, device=device)
 
     with torch.no_grad():
-        out1 = tb.apply(x, A_DEDROP)
-        out2 = tb.apply(x, A_DEBLUR)
-        out3 = tb.apply(x, A_HYBRID)
+        out_stop = tb.apply(x, A_STOP)
+        out_drop = tb.apply(x, A_DEDROP)
+        out_blur = tb.apply(x, A_DEBLUR)
+        out_rain = tb.apply(x, A_DERAIN)
+        out_snow = tb.apply(x, A_DESNOW)
+        out_haze = tb.apply(x, A_DEHAZE)
 
-    print("drop-blur diff:", (out1 - out2).abs().mean().item())
-    print("drop-hybrid diff:", (out1 - out3).abs().mean().item())
+    print("stop-drop diff:", (out_stop - out_drop).abs().mean().item())
+    print("drop-blur diff:", (out_drop - out_blur).abs().mean().item())
+    print("blur-rain diff:", (out_blur - out_rain).abs().mean().item())
+    print("snow-haze diff:", (out_snow - out_haze).abs().mean().item())
 
-    with torch.no_grad():
-        out_stop = tb.apply(out3, A_STOP)
-    print("stop diff:", (out_stop - out3).abs().mean().item())
+    tb.activate_adapter(A_STOP)
+    print("[SCALES][STOP] first states:", tb.diag_first_lora_states(limit=8))
+    tb.activate_adapter(A_DEBLUR)
+    print("[SCALES][DEBLUR] first states:", tb.diag_first_lora_states(limit=8))
+    tb.activate_adapter(A_STOP)
+    print("[SCALES][STOP2] first states:", tb.diag_first_lora_states(limit=8))
 
-    print("[DEBUG] ToolBank + VETNet STRUCTURE OK ✅")
+    # param split sanity: same wrapper, different action params => different tensor ids
+    p_blur = tb.get_action_parameters(A_DEBLUR)
+    p_rain = tb.get_action_parameters(A_DERAIN)
+    inter = set(id(p) for p in p_blur).intersection(set(id(p) for p in p_rain))
+    print(f"[ParamSplit] |DEBLUR|={len(p_blur)} |DERAIN|={len(p_rain)} shared_param_ids={len(inter)}")
+
+    print("[DEBUG] ToolBank (NO HYBRID) OK ✅")

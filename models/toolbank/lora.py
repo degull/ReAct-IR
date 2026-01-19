@@ -1,163 +1,280 @@
 # models/toolbank/lora.py
-import os
-import sys
-from typing import Dict, List, Optional
-
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
+from typing import Dict, List, Optional, Sequence
+
+from torch import Tensor
+from torch.nn import Module, ModuleDict, Linear, Conv2d, Dropout, Dropout2d, Identity
 
 
 # ============================================================
-# LoRA Modules
+# Multi-Adapter LoRA (action-specific params, shared base)
 # ============================================================
 
-class LoRALinear(nn.Module):
+class MultiLoRALinear(Module):
     """
-    LoRA for nn.Linear
+    Multi-adapter LoRA for nn.Linear.
+
+    y = base(x) + (scale * alpha/r) * B_action( Drop( A_action(x) ) )
     """
-    def __init__(self, base: nn.Linear, r: int = 4, alpha: float = 1.0):
-        super().__init__()
-        self.base = base
-        self.r = r
-        self.alpha = alpha
-        self.scale = alpha / r
 
-        self.lora_A = nn.Linear(base.in_features, r, bias=False)
-        self.lora_B = nn.Linear(r, base.out_features, bias=False)
-
-        nn.init.kaiming_uniform_(self.lora_A.weight, a=5 ** 0.5)
-        nn.init.zeros_(self.lora_B.weight)
-
-        # freeze base
-        for p in self.base.parameters():
-            p.requires_grad = False
-
-    def forward(self, x):
-        return self.base(x) + self.lora_B(self.lora_A(x)) * self.scale
-
-
-class LoRAConv2d(nn.Module):
     def __init__(
         self,
-        base: nn.Conv2d,
+        base: Linear,
+        actions: Sequence[str],
         r: int = 4,
         alpha: float = 1.0,
-        force_nonzero_init: bool = False,  # 🔥 추가
+        dropout: float = 0.0,
+        init_B_zero: bool = True,
+        force_nonzero_init: bool = False,
     ):
         super().__init__()
         self.is_lora = True
         self.base = base
 
-        self.r = r
-        self.alpha = alpha
-        self.force_nonzero_init = force_nonzero_init
+        self.r = int(r)
+        self.alpha = float(alpha)
+        self.dropout_p = float(dropout)
 
-        # scale은 반드시 Tensor
-        self.register_buffer("scale", torch.tensor(alpha / r))
+        # runtime state
+        self.current_action: Optional[str] = None
+        self.active: bool = False
+        self.register_buffer("scale", torch.tensor(0.0))  # runtime-controlled
 
-        self.lora_A = nn.Conv2d(
-            base.in_channels, r, kernel_size=1, bias=False
-        )
-        self.lora_B = nn.Conv2d(
-            r,
-            base.out_channels,
-            kernel_size=base.kernel_size,
-            stride=base.stride,
-            padding=base.padding,
-            dilation=base.dilation,
-            bias=False,
-        )
+        self.actions: List[str] = list(actions)
 
-        nn.init.kaiming_uniform_(self.lora_A.weight, a=5 ** 0.5)
+        self.lora_A: ModuleDict = ModuleDict()
+        self.lora_B: ModuleDict = ModuleDict()
+        self.lora_drop: ModuleDict = ModuleDict()
 
-        if force_nonzero_init:
-            nn.init.kaiming_uniform_(self.lora_B.weight, a=5 ** 0.5)
-            print("[DEBUG] LoRAConv2d force_nonzero_init=ON")
-        else:
-            nn.init.zeros_(self.lora_B.weight)
+        for a in self.actions:
+            self.lora_A[a] = Linear(base.in_features, self.r, bias=False)
+            self.lora_B[a] = Linear(self.r, base.out_features, bias=False)
+            self.lora_drop[a] = Dropout(self.dropout_p) if self.dropout_p > 0 else Identity()
+
+            nn.init.kaiming_uniform_(self.lora_A[a].weight, a=5 ** 0.5)
+
+            if force_nonzero_init:
+                nn.init.kaiming_uniform_(self.lora_B[a].weight, a=5 ** 0.5)
+            else:
+                if init_B_zero:
+                    nn.init.zeros_(self.lora_B[a].weight)
+                else:
+                    nn.init.kaiming_uniform_(self.lora_B[a].weight, a=5 ** 0.5)
+
+        # freeze base
+        for p in self.base.parameters():
+            p.requires_grad = False
+
+    def set_action(self, action: Optional[str]) -> None:
+        if action is None:
+            self.current_action = None
+            self.active = False
+            return
+        if action not in self.lora_A:
+            raise KeyError(f"[MultiLoRALinear] unknown action: {action}")
+        self.current_action = action
+        self.active = True
+
+    def set_scale(self, s: float) -> None:
+        self.scale.data = self.scale.new_tensor(float(s))
+
+    def forward(self, x: Tensor) -> Tensor:
+        y = self.base(x)
+        if (not self.active) or (self.current_action is None):
+            return y
+        if float(self.scale.detach().item()) == 0.0:
+            return y
+
+        a = self.current_action
+        z = self.lora_A[a](x)
+        z = self.lora_drop[a](z)
+        z = self.lora_B[a](z)
+
+        base_scale = self.alpha / float(self.r)
+        return y + z * (self.scale * base_scale)
+
+
+class MultiLoRAConv2d(Module):
+    """
+    Multi-adapter LoRA for nn.Conv2d.
+
+    y = base(x) + (scale * alpha/r) * B_action( Drop2d( A_action(x) ) )
+    """
+
+    def __init__(
+        self,
+        base: Conv2d,
+        actions: Sequence[str],
+        r: int = 4,
+        alpha: float = 1.0,
+        dropout: float = 0.0,
+        init_B_zero: bool = True,
+        force_nonzero_init: bool = False,
+    ):
+        super().__init__()
+        self.is_lora = True
+        self.base = base
+
+        self.r = int(r)
+        self.alpha = float(alpha)
+        self.dropout_p = float(dropout)
+
+        # runtime state
+        self.current_action: Optional[str] = None
+        self.active: bool = False
+        self.register_buffer("scale", torch.tensor(0.0))  # runtime-controlled
+
+        self.actions: List[str] = list(actions)
+
+        self.lora_A: ModuleDict = ModuleDict()
+        self.lora_B: ModuleDict = ModuleDict()
+        self.lora_drop: ModuleDict = ModuleDict()
+
+        for a in self.actions:
+            self.lora_A[a] = Conv2d(base.in_channels, self.r, kernel_size=1, bias=False)
+            self.lora_B[a] = Conv2d(
+                self.r,
+                base.out_channels,
+                kernel_size=base.kernel_size,
+                stride=base.stride,
+                padding=base.padding,
+                dilation=base.dilation,
+                bias=False,
+            )
+            self.lora_drop[a] = Dropout2d(self.dropout_p) if self.dropout_p > 0 else Identity()
+
+            nn.init.kaiming_uniform_(self.lora_A[a].weight, a=5 ** 0.5)
+
+            if force_nonzero_init:
+                nn.init.kaiming_uniform_(self.lora_B[a].weight, a=5 ** 0.5)
+            else:
+                if init_B_zero:
+                    nn.init.zeros_(self.lora_B[a].weight)
+                else:
+                    nn.init.kaiming_uniform_(self.lora_B[a].weight, a=5 ** 0.5)
 
         # freeze base conv
         for p in self.base.parameters():
             p.requires_grad = False
 
+    def set_action(self, action: Optional[str]) -> None:
+        if action is None:
+            self.current_action = None
+            self.active = False
+            return
+        if action not in self.lora_A:
+            raise KeyError(f"[MultiLoRAConv2d] unknown action: {action}")
+        self.current_action = action
+        self.active = True
 
-    def set_scale(self, s: float):
-        self.scale.data = self.scale.new_tensor(s)
+    def set_scale(self, s: float) -> None:
+        self.scale.data = self.scale.new_tensor(float(s))
 
-    def forward(self, x):
-        return self.base(x) + self.lora_B(self.lora_A(x)) * self.scale
+    def forward(self, x: Tensor) -> Tensor:
+        y = self.base(x)
+        if (not self.active) or (self.current_action is None):
+            return y
+        if float(self.scale.detach().item()) == 0.0:
+            return y
 
+        a = self.current_action
+        z = self.lora_A[a](x)
+        z = self.lora_drop[a](z)
+        z = self.lora_B[a](z)
+
+        base_scale = self.alpha / float(self.r)
+        return y + z * (self.scale * base_scale)
 
 
 # ============================================================
-# LoRA Injector
+# Injector (wrap selected modules once; register adapters inside)
 # ============================================================
 
-class LoRAInjector:
+class MultiLoRAInjector:
     """
-    Inject LoRA modules into a backbone.
+    Replace target Conv2d / Linear layers with MultiLoRA wrappers.
+    Inject ONCE and store multiple adapters per action inside the wrapper.
     """
 
     def __init__(
         self,
+        actions: Sequence[str],
         r: int = 4,
         alpha: float = 1.0,
+        dropout: float = 0.0,
         target_modules: Optional[List[str]] = None,
         verbose: bool = True,
+        init_B_zero: bool = True,
+        force_nonzero_init: bool = False,
+        enable_linear: bool = False,
     ):
-        self.r = r
-        self.alpha = alpha
+        self.actions = list(actions)
+        self.r = int(r)
+        self.alpha = float(alpha)
+        self.dropout = float(dropout)
         self.target_modules = target_modules
-        self.verbose = verbose
+        self.verbose = bool(verbose)
+        self.init_B_zero = bool(init_B_zero)
+        self.force_nonzero_init = bool(force_nonzero_init)
+        self.enable_linear = bool(enable_linear)
 
     def _match(self, name: str) -> bool:
         if self.target_modules is None:
             return True
         return any(t in name for t in self.target_modules)
 
-    def inject(self, model: nn.Module) -> Dict[str, nn.Module]:
-        """
-        Replace target layers with LoRA wrapped layers.
-        Returns dict of injected modules.
-        """
-        injected = {}
+    def inject(self, model: Module) -> Dict[str, Module]:
+        injected: Dict[str, Module] = {}
 
-        for name, module in model.named_modules():
+        # IMPORTANT: iterate on snapshot (tree changes during injection)
+        for name, module in list(model.named_modules()):
             if not self._match(name):
                 continue
 
             parent = self._get_parent(model, name)
             if parent is None:
                 continue
-
             key = name.split(".")[-1]
 
-            if isinstance(module, nn.Linear):
-                wrapped = LoRALinear(module, self.r, self.alpha)
+            if isinstance(module, Conv2d):
+                wrapped = MultiLoRAConv2d(
+                    module,
+                    actions=self.actions,
+                    r=self.r,
+                    alpha=self.alpha,
+                    dropout=self.dropout,
+                    init_B_zero=self.init_B_zero,
+                    force_nonzero_init=self.force_nonzero_init,
+                )
                 setattr(parent, key, wrapped)
                 injected[name] = wrapped
                 if self.verbose:
-                    print(f"[LoRAInjector] Injected LoRA Linear: {name}")
+                    print(f"[MultiLoRAInjector] Injected MultiLoRAConv2d: {name}")
 
-            elif isinstance(module, nn.Conv2d):
-                wrapped = LoRAConv2d(module, self.r, self.alpha)
+            elif self.enable_linear and isinstance(module, Linear):
+                wrapped = MultiLoRALinear(
+                    module,
+                    actions=self.actions,
+                    r=self.r,
+                    alpha=self.alpha,
+                    dropout=self.dropout,
+                    init_B_zero=self.init_B_zero,
+                    force_nonzero_init=self.force_nonzero_init,
+                )
                 setattr(parent, key, wrapped)
                 injected[name] = wrapped
                 if self.verbose:
-                    print(f"[LoRAInjector] Injected LoRA Conv2d: {name}")
+                    print(f"[MultiLoRAInjector] Injected MultiLoRALinear: {name}")
 
         if self.verbose:
-            print(f"[LoRAInjector] Total injected modules: {len(injected)}")
-
+            print(f"[MultiLoRAInjector] Total injected modules: {len(injected)}")
         return injected
 
-    def _get_parent(self, model: nn.Module, name: str) -> Optional[nn.Module]:
-        """
-        Get parent module given full module name.
-        """
+    def _get_parent(self, model: Module, name: str) -> Optional[Module]:
         parts = name.split(".")
-        cur = model
+        cur: Module = model
         for p in parts[:-1]:
             if not hasattr(cur, p):
                 return None
@@ -169,56 +286,76 @@ class LoRAInjector:
 # Debug / Smoke Test
 # ============================================================
 
-def _count_trainable_params(model: nn.Module) -> int:
+def _count_trainable_params(model: Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def _count_total_params(model: nn.Module) -> int:
+def _count_total_params(model: Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
 
 if __name__ == "__main__":
-    """
-    Smoke test for LoRA injection.
-
-    This does NOT depend on VETNet.
-    It tests injection on a dummy model.
-    """
-
-    class DummyNet(nn.Module):
+    class DummyNet(Module):
         def __init__(self):
             super().__init__()
-            self.conv1 = nn.Conv2d(3, 32, 3, padding=1)
-            self.conv2 = nn.Conv2d(32, 32, 3, padding=1)
-            self.fc = nn.Linear(32, 10)
+            self.conv1 = Conv2d(3, 16, 3, padding=1)
+            self.conv2 = Conv2d(16, 16, 3, padding=1)
+            self.fc = Linear(16, 10)
 
-        def forward(self, x):
+        def forward(self, x: Tensor) -> Tensor:
             x = self.conv1(x)
             x = self.conv2(x)
             x = x.mean(dim=[2, 3])
             x = self.fc(x)
             return x
 
+    actions = ["A_DEBLUR", "A_DERAIN"]
+
     print("\n[DEBUG] Creating DummyNet...")
     net = DummyNet()
     print(f"[DEBUG] Total params (before): {_count_total_params(net)}")
     print(f"[DEBUG] Trainable params (before): {_count_trainable_params(net)}")
 
-    injector = LoRAInjector(
-        r=8,
-        alpha=8.0,
-        target_modules=None,  # inject all conv/linear
-        verbose=True
+    injector = MultiLoRAInjector(
+        actions=actions,
+        r=4,
+        alpha=4.0,
+        dropout=0.0,
+        target_modules=None,
+        verbose=True,
+        init_B_zero=True,
+        force_nonzero_init=True,  # make diffs non-zero immediately
+        enable_linear=True,
     )
 
-    print("\n[DEBUG] Injecting LoRA...")
+    print("\n[DEBUG] Injecting MultiLoRA...")
     injector.inject(net)
+
+    # Activate one action globally
+    for _, m in net.named_modules():
+        if isinstance(m, (MultiLoRAConv2d, MultiLoRALinear)):
+            m.set_action("A_DEBLUR")
+            m.set_scale(1.0)
 
     print(f"[DEBUG] Total params (after): {_count_total_params(net)}")
     print(f"[DEBUG] Trainable params (after): {_count_trainable_params(net)}")
 
-    x = torch.randn(2, 3, 64, 64)
-    y = net(x)
+    x = torch.randn(2, 3, 32, 32)
+    with torch.no_grad():
+        y_deblur = net(x)
 
-    print(f"[DEBUG] Forward OK. Output shape: {y.shape}")
-    print("[DEBUG] LoRAInjector OK ✅")
+        for _, m in net.named_modules():
+            if isinstance(m, (MultiLoRAConv2d, MultiLoRALinear)):
+                m.set_action("A_DERAIN")
+                m.set_scale(1.0)
+        y_derain = net(x)
+
+        for _, m in net.named_modules():
+            if isinstance(m, (MultiLoRAConv2d, MultiLoRALinear)):
+                m.set_action(None)
+                m.set_scale(0.0)
+        y_stop = net(x)
+
+    print(f"[DEBUG] diff(deblur-derain) mean: {(y_deblur - y_derain).abs().mean().item():.6f}")
+    print(f"[DEBUG] diff(deblur-stop)  mean: {(y_deblur - y_stop).abs().mean().item():.6f}")
+    print("[DEBUG] MultiLoRA OK ✅")

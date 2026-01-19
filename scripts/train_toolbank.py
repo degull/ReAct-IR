@@ -3,12 +3,11 @@ import os
 import sys
 import time
 import random
-from typing import List, Dict, DefaultDict
+from typing import List, Dict, DefaultDict, Tuple
 from collections import defaultdict
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.amp import autocast, GradScaler
 from tqdm import tqdm
@@ -112,19 +111,38 @@ class PairedTransform:
 # --------------------------------------------------
 # Oracle Action
 # --------------------------------------------------
-def choose_oracle_action(degs: List[str]) -> str:
-    d = set(x.lower() for x in degs)
-    if "drop" in d:
-        return A_DEDROP
-    if "rain" in d:
-        return A_DERAIN
-    if "haze" in d:
-        return A_DEHAZE
-    if "snow" in d:
+def choose_oracle_action(
+    degs: List[str],
+    p_hybrid_when_multi: float = 0.7,
+    p_force_desnow_in_multi: float = 0.3,
+) -> str:
+    d = [x.lower() for x in degs]
+    s = set(d)
+
+    cand = []
+    if "drop" in s:
+        cand.append(A_DEDROP)
+    if "rain" in s:
+        cand.append(A_DERAIN)
+    if "haze" in s:
+        cand.append(A_DEHAZE)
+    if "snow" in s:
+        cand.append(A_DESNOW)
+    if "blur" in s:
+        cand.append(A_DEBLUR)
+
+    if len(cand) == 0:
+        return A_HYBRID
+    if len(cand) == 1:
+        return cand[0]
+
+    if random.random() < float(p_hybrid_when_multi):
+        return A_HYBRID
+
+    if (A_DESNOW in cand) and (random.random() < float(p_force_desnow_in_multi)):
         return A_DESNOW
-    if "blur" in d:
-        return A_DEBLUR
-    return A_HYBRID
+
+    return random.choice(cand)
 
 
 # --------------------------------------------------
@@ -144,82 +162,363 @@ def react_ir_collate_fn(batch):
 def collect_lora_params(model: nn.Module):
     params = []
     seen = set()
-    for m in model.modules():
-        if hasattr(m, "is_lora") and m.is_lora:
-            for p in m.parameters():
-                if id(p) not in seen:
-                    p.requires_grad = True
-                    params.append(p)
-                    seen.add(id(p))
+    for name, p in model.named_parameters():
+        # LoRAConv2d 내부의 base.weight는 제외하고, lora_A/lora_B만 학습
+        if (".lora_A." in name) or (".lora_B." in name):
+            if id(p) not in seen:
+                p.requires_grad = True
+                params.append(p)
+                seen.add(id(p))
+        else:
+            # 혹시라도 base가 풀렸으면 다시 잠그기(보험)
+            if ".base." in name:
+                p.requires_grad = False
     return params
 
 
 # --------------------------------------------------
-# ToolBank Sanity Metrics (핵심: 학습 중 on/off 검증)
+# Action param cache (authoritative)
 # --------------------------------------------------
-def lora_grad_norm_for_action(toolbank: ToolBank, action: str) -> float:
-    """
-    현재 step에서 action에 해당하는 LoRA 모듈들의 grad L2 norm 합.
-    - action이 제대로 분기되면: 선택된 action의 grad norm이 상대적으로 커지고,
-      선택 안 된 action들은 매우 작아야 정상.
-    """
-    total = 0.0
-    modules = toolbank.adapters.get(action, [])
-    for m in modules:
-        for p in m.parameters():
-            if p.grad is not None:
-                total += float(p.grad.data.norm(2).item())
-    return total
+def build_action_param_cache(toolbank: ToolBank) -> Dict[str, List[torch.nn.Parameter]]:
+    cache: Dict[str, List[torch.nn.Parameter]] = {}
+    for action, modules in toolbank.adapters.items():
+        params = []
+        seen = set()
+        for m in modules:
+            for p in m.parameters():
+                if id(p) not in seen:
+                    params.append(p)
+                    seen.add(id(p))
+        cache[action] = params
+    return cache
 
 
-@torch.no_grad()
-def output_diff_vs_stop(toolbank: ToolBank, x: torch.Tensor, action: str) -> float:
-    """
-    같은 입력 x에 대해:
-      - LoRA OFF (A_STOP) 출력
-      - 해당 action LoRA ON 출력
-    두 출력의 평균 절대차를 리턴.
-    - 0에 가깝다면 LoRA가 사실상 영향이 없는 상태일 수 있음.
-    """
-    x1 = x[:1]  # 비용 절감: 1개 샘플만
-    toolbank.activate_adapter(A_STOP)
-    out_stop = toolbank.backbone(x1)
-
-    toolbank.activate_adapter(action)
-    out_act = toolbank.backbone(x1)
-
-    return float((out_act - out_stop).abs().mean().item())
+def grad_norm_for_action_params(action_param_cache: Dict[str, List[torch.nn.Parameter]], action: str) -> float:
+    sq_sum = 0.0
+    for p in action_param_cache.get(action, []):
+        if p.grad is None:
+            continue
+        g = p.grad.detach()
+        sq_sum += float(g.float().pow(2).sum().item())
+    return float(sq_sum ** 0.5)
 
 
-@torch.no_grad()
-def action_separation_score(
-    toolbank: ToolBank,
-    x: torch.Tensor,
-    sel_action: str,
-    neg_action: str,
+def grad_norm_sum_except_params(
+    action_param_cache: Dict[str, List[torch.nn.Parameter]],
+    exclude_action: str,
+    actions: List[str],
 ) -> float:
-    """
-    (추가 SANITY) action separation score:
-      score = mean(|f_sel(x) - f_neg(x)|) / (mean(|f_sel(x) - f_stop(x)|) + eps)
+    sq_sum = 0.0
+    for a in actions:
+        if a == exclude_action:
+            continue
+        for p in action_param_cache.get(a, []):
+            if p.grad is None:
+                continue
+            g = p.grad.detach()
+            sq_sum += float(g.float().pow(2).sum().item())
+    return float(sq_sum ** 0.5)
 
-    - 분리(score ↑): 선택 action 출력이 다른 action과 충분히 다름
-    - 정상화(denom): LoRA 자체의 유효 영향(Stop 대비)을 기준으로 스케일 불변 비교
+
+# --------------------------------------------------
+# Δθ silence
+# --------------------------------------------------
+def build_action_theta0_snapshot_fp16(
+    action_param_cache: Dict[str, List[torch.nn.Parameter]],
+) -> Dict[str, List[torch.Tensor]]:
+    snap: Dict[str, List[torch.Tensor]] = {}
+    for a, params in action_param_cache.items():
+        snap[a] = [p.detach().to("cpu", dtype=torch.float16).clone() for p in params]
+    return snap
+
+
+def silence_delta_theta_loss_mean(
+    action_param_cache: Dict[str, List[torch.nn.Parameter]],
+    theta0_snapshot_fp16_cpu: Dict[str, List[torch.Tensor]],
+    active_action: str,
+) -> torch.Tensor:
+    device = None
+    loss = None
+    count = 0
+
+    for a, params in action_param_cache.items():
+        if a == active_action:
+            continue
+        t0_list = theta0_snapshot_fp16_cpu.get(a, None)
+        if t0_list is None or len(t0_list) != len(params):
+            continue
+
+        for p, t0_cpu in zip(params, t0_list):
+            if device is None:
+                device = p.device
+            t0 = t0_cpu.to(device=p.device, dtype=p.dtype, non_blocking=True)
+            diff = (p - t0)
+            term = torch.mean(diff * diff)
+            loss = term if loss is None else (loss + term)
+            count += 1
+
+    if loss is None:
+        return torch.tensor(
+            0.0,
+            device=(device if device is not None else ("cuda" if torch.cuda.is_available() else "cpu")),
+        )
+    return loss / float(max(1, count))
+
+
+# --------------------------------------------------
+# DIAG A) optimizer param coverage / id match
+# --------------------------------------------------
+def _build_param_owner_name_map(model: nn.Module) -> Dict[int, str]:
     """
-    eps = 1e-8
+    id(param) -> "module_name.param_name" mapping for readable debugging.
+    """
+    m = {}
+    for mod_name, mod in model.named_modules():
+        for pn, p in mod.named_parameters(recurse=False):
+            m[id(p)] = f"{mod_name}.{pn}" if mod_name else pn
+    return m
+
+
+def diag_optimizer_lora_coverage_once(
+    toolbank: nn.Module,
+    trainable_lora: List[torch.nn.Parameter],
+    optimizer: torch.optim.Optimizer,
+    action_param_cache: Dict[str, List[torch.nn.Parameter]],
+    k_print: int = 5,
+):
+    # 1) counts
+    opt_ids = set()
+    opt_param_cnt = 0
+    for gi, g in enumerate(optimizer.param_groups):
+        ps = g.get("params", [])
+        opt_param_cnt += len(ps)
+        for p in ps:
+            opt_ids.add(id(p))
+
+    lora_ids = {id(p) for p in trainable_lora}
+
+    cache_ids = set()
+    for a, ps in action_param_cache.items():
+        for p in ps:
+            cache_ids.add(id(p))
+
+    # 2) id set relations
+    lora_not_in_opt = sorted(list(lora_ids - opt_ids))
+    cache_not_in_opt = sorted(list(cache_ids - opt_ids))
+    lora_not_in_cache = sorted(list(lora_ids - cache_ids))
+    cache_not_in_lora = sorted(list(cache_ids - lora_ids))
+
+    # 3) printable names
+    name_map = _build_param_owner_name_map(toolbank)
+
+    def _fmt(pid: int) -> str:
+        return name_map.get(pid, "<unknown>")
+
+    print("\n" + "-" * 78)
+    print("[DIAG][OPT] optimizer param coverage check (ONCE)")
+    print(f"[DIAG][OPT] len(trainable_lora) = {len(trainable_lora)}")
+    print(f"[DIAG][OPT] optimizer.param_groups = {len(optimizer.param_groups)}")
+    print(f"[DIAG][OPT] optimizer total param count (sum of groups) = {opt_param_cnt}")
+    print(f"[DIAG][OPT] unique ids in optimizer = {len(opt_ids)}")
+    print(f"[DIAG][OPT] unique ids in trainable_lora = {len(lora_ids)}")
+    print(f"[DIAG][OPT] unique ids in action_param_cache(all) = {len(cache_ids)}")
+
+    print(f"[DIAG][OPT] trainable_lora NOT in optimizer = {len(lora_not_in_opt)}")
+    if len(lora_not_in_opt) > 0:
+        for pid in lora_not_in_opt[: min(k_print, len(lora_not_in_opt))]:
+            print(f"  - missing(lora->opt): id={pid} name={_fmt(pid)}")
+
+    print(f"[DIAG][OPT] action_param_cache params NOT in optimizer = {len(cache_not_in_opt)}")
+    if len(cache_not_in_opt) > 0:
+        for pid in cache_not_in_opt[: min(k_print, len(cache_not_in_opt))]:
+            print(f"  - missing(cache->opt): id={pid} name={_fmt(pid)}")
+
+    print(f"[DIAG][OPT] trainable_lora NOT in action_param_cache = {len(lora_not_in_cache)}")
+    if len(lora_not_in_cache) > 0:
+        for pid in lora_not_in_cache[: min(k_print, len(lora_not_in_cache))]:
+            print(f"  - mismatch(lora not in cache): id={pid} name={_fmt(pid)}")
+
+    print(f"[DIAG][OPT] action_param_cache NOT in trainable_lora = {len(cache_not_in_lora)}")
+    if len(cache_not_in_lora) > 0:
+        for pid in cache_not_in_lora[: min(k_print, len(cache_not_in_lora))]:
+            print(f"  - mismatch(cache not in lora): id={pid} name={_fmt(pid)}")
+
+    # 4) sample 5 params from trainable_lora
+    print(f"[DIAG][OPT] sample {min(k_print, len(trainable_lora))} params from trainable_lora:")
+    for p in trainable_lora[: min(k_print, len(trainable_lora))]:
+        pid = id(p)
+        nm = name_map.get(pid, "<unknown>")
+        print(
+            f"  - name={nm} id={pid} requires_grad={bool(p.requires_grad)} "
+            f"dtype={str(p.dtype)} device={str(p.device)}"
+        )
+    print("-" * 78 + "\n")
+
+
+# --------------------------------------------------
+# DIAG 1) scan backbone LoRA module states
+# --------------------------------------------------
+def diag_scan_lora_modules(backbone: nn.Module, limit: int = 8) -> str:
+    """
+    backbone 안의 LoRA 관련 모듈을 스캔해서,
+    enable/scale/active_adapter 같은 상태가 실제로 바뀌는지 확인용 문자열 리턴.
+    (프로젝트마다 속성명이 다를 수 있어 '있는 것만' 출력)
+    """
+    lines = []
+    cnt = 0
+    for name, m in backbone.named_modules():
+        if hasattr(m, "is_lora") and bool(getattr(m, "is_lora")):
+            fields = {}
+            for k in [
+                "enabled", "enable", "active", "active_adapter", "current_action",
+                "scale", "scaling", "alpha", "rank", "merged"
+            ]:
+                if hasattr(m, k):
+                    v = getattr(m, k)
+                    try:
+                        if torch.is_tensor(v):
+                            v = float(v.detach().cpu().item())
+                    except Exception:
+                        pass
+                    fields[k] = v
+            lines.append(f"[LoRA] {name} :: {fields}")
+            cnt += 1
+            if cnt >= limit:
+                break
+    if cnt == 0:
+        return "[LoRA] No modules found with attribute is_lora=True in backbone."
+    return "\n".join(lines)
+
+
+# --------------------------------------------------
+# DIAG 2) track param updates (Δparam)
+# --------------------------------------------------
+def diag_pick_params(
+    action_param_cache: Dict[str, List[torch.nn.Parameter]],
+    actions: List[str],
+    k_per_action: int = 1,
+):
+    picks = {}
+    for a in actions:
+        ps = action_param_cache.get(a, [])
+        if len(ps) == 0:
+            continue
+        picks[a] = ps[:k_per_action]
+    return picks
+
+
+def diag_param_stats(p: torch.nn.Parameter):
+    with torch.no_grad():
+        w = p.detach()
+        return float(w.float().norm().item()), float(w.float().abs().max().item())
+
+
+# --------------------------------------------------
+# ActionGate
+# --------------------------------------------------
+class ActionGate(nn.Module):
+    def __init__(
+        self,
+        actions: List[str],
+        init: float = 0.9,
+        clamp_min: float = 0.0,
+        clamp_max: float = 1.0,
+        eps: float = 1e-4,
+    ):
+        super().__init__()
+        self.actions = list(actions)
+        self.clamp_min = float(clamp_min)
+        self.clamp_max = float(clamp_max)
+        self.eps = float(eps)
+
+        self.logits = nn.ParameterDict()
+
+        init = float(init)
+        init = float(np.clip(init, self.eps, 1.0 - self.eps))
+        init_logit = float(np.log(init / (1.0 - init)))
+
+        for a in self.actions:
+            self.logits[a] = nn.Parameter(torch.tensor(init_logit, dtype=torch.float32))
+
+    def get_gate(self, action: str, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        if action not in self.logits:
+            base = torch.tensor(1.0, device=device, dtype=dtype)
+        else:
+            base = torch.sigmoid(self.logits[action].to(device=device, dtype=dtype))
+        g = self.clamp_min + (self.clamp_max - self.clamp_min) * base
+        return g
+
+
+class ToolBankWithActionGate(ToolBank):
+    """
+    apply(x, action) = stop_out + gate(action) * (act_out - stop_out)
+    """
+
+    def __init__(
+        self,
+        backbone: nn.Module,
+        adapter_specs: Dict[str, AdapterSpec],
+        device,
+        debug: bool = False,
+        gate_actions: List[str] = None,
+        gate_init: float = 0.9,
+        gate_clamp: Tuple[float, float] = (0.0, 1.0),
+    ):
+        super().__init__(backbone, adapter_specs, device=device, debug=debug)
+        if gate_actions is None:
+            gate_actions = [A_DEDROP, A_DEBLUR, A_DERAIN, A_DESNOW, A_DEHAZE, A_HYBRID]
+        self.action_gate = ActionGate(
+            actions=gate_actions,
+            init=gate_init,
+            clamp_min=float(gate_clamp[0]),
+            clamp_max=float(gate_clamp[1]),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.backbone(x)
+
+    def _tb_forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward(x)
+
+    def apply(self, x: torch.Tensor, action: str):
+        # base (STOP) - no grad needed
+        self.activate_adapter(A_STOP)
+        with torch.no_grad():
+            out_base = self._tb_forward(x)
+
+        if action == A_STOP:
+            return out_base
+
+        # action output (grad flows into LoRA + gate)
+        self.activate_adapter(action)
+        out_act = self._tb_forward(x)
+
+        g = self.action_gate.get_gate(action, device=out_act.device, dtype=out_act.dtype)
+        out = out_base + g * (out_act - out_base)
+        return out
+
+    def get_gate_value(self, action: str) -> float:
+        with torch.no_grad():
+            if action not in self.action_gate.logits:
+                return 1.0
+            v = float(torch.sigmoid(self.action_gate.logits[action]).detach().cpu().item())
+            gv = self.action_gate.clamp_min + (self.action_gate.clamp_max - self.action_gate.clamp_min) * v
+            return float(np.clip(gv, self.action_gate.clamp_min, self.action_gate.clamp_max))
+
+
+# --------------------------------------------------
+# DIAG delta stats: mean/max/rms (eps 제거: 0이면 0)
+# --------------------------------------------------
+@torch.no_grad()
+def output_delta_stats_vs_stop(toolbank: ToolBankWithActionGate, x: torch.Tensor, action: str) -> Dict[str, float]:
     x1 = x[:1]
-
-    toolbank.activate_adapter(A_STOP)
-    out_stop = toolbank.backbone(x1)
-
-    toolbank.activate_adapter(sel_action)
-    out_sel = toolbank.backbone(x1)
-
-    toolbank.activate_adapter(neg_action)
-    out_neg = toolbank.backbone(x1)
-
-    num = float((out_sel - out_neg).abs().mean().item())
-    den = float((out_sel - out_stop).abs().mean().item())
-    return float(num / (den + eps))
+    out_stop = toolbank.apply(x1, A_STOP)
+    out_act = toolbank.apply(x1, action)
+    delta = (out_act - out_stop).float()
+    mean_abs = float(delta.abs().mean().item())
+    max_abs = float(delta.abs().max().item())
+    rms = float(torch.sqrt(torch.mean(delta * delta)).item())  # NOTE: eps 더하지 않음
+    return {"mean_abs": mean_abs, "max_abs": max_abs, "rms": rms}
 
 
 # --------------------------------------------------
@@ -236,6 +535,8 @@ def build_single_dataset(root, cfg, tfm):
         return NightRainDropDataset(root=root, split=split, transform=tfm, debug=False)
     if t == "Rain100Dataset":
         return Rain100Dataset(root=root, split=split, transform=tfm, debug=False)
+    if t == "RESIDE6KDataset":
+        return RESIDE6KDataset(root=root, split=split, transform=tfm, debug=False)
     if t == "RESIDE6KDataset":
         return RESIDE6KDataset(root=root, split=split, transform=tfm, debug=False)
     raise ValueError(t)
@@ -255,26 +556,13 @@ def build_mixed_dataset(cfg, tfm):
 
 
 # --------------------------------------------------
-# Action-Contrastive helpers (최소 변경)
+# Action helpers
 # --------------------------------------------------
-ALL_ACTIONS = [A_DEDROP, A_DEBLUR, A_DERAIN, A_DESNOW, A_DEHAZE, A_HYBRID]
-
-
-def sample_negative_action(pos_action: str, oracle_actions: List[str]) -> str:
-    """
-    negative action 1개 샘플.
-    - 기본: pos_action 제외한 전체 action 중 랜덤
-    - oracle_actions(배치 내 다양성)가 있다면 거기서 먼저 뽑아주는 게 더 'hard negative'가 될 수 있음
-    """
-    # hard negative 우선: 같은 배치 oracle 안에서 pos와 다른 action이 있으면 거기서 선택
-    uniq = list(set(oracle_actions))
-    cand = [a for a in uniq if a != pos_action]
-    if len(cand) > 0:
-        return random.choice(cand)
-
-    # fallback: 전체 action 중 pos 제외
-    cand2 = [a for a in ALL_ACTIONS if a != pos_action]
-    return random.choice(cand2)
+def build_cycle_actions(cfg_tools: dict) -> List[str]:
+    cyc = cfg_tools.get("train", {}).get("balance_cycle", None)
+    if cyc is None:
+        return [A_DEDROP, A_DEBLUR, A_DERAIN, A_DESNOW, A_DEHAZE, A_HYBRID]
+    return list(cyc)
 
 
 # --------------------------------------------------
@@ -288,33 +576,43 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("[Device]", device)
 
-    # ------------------------------
-    # Sanity logging frequency
-    # ------------------------------
-    # tools.yaml에 없으면 기본값 사용
     sanity_every = int(cfg_tools.get("train", {}).get("sanity_every", 200))
     diff_every = int(cfg_tools.get("train", {}).get("diff_every", 500))
+    log_every = int(cfg_tools.get("train", {}).get("log_every", 50))
 
-    # ------------------------------
-    # (Condition-1) Action 실패 시 손해: action_specific_penalty
-    #   - 배치 내 oracle action과 선택 action이 불일치한 비율(mismatch_rate)에 비례해 loss에 가산
-    # ------------------------------
-    action_specific_penalty = float(cfg_tools.get("train", {}).get("action_specific_penalty", 0.0))
+    # diag_steps: 강제 DIAG(=sanity+diff+추가 상태 출력) 찍는 step 리스트
+    diag_steps = cfg_tools.get("train", {}).get("diag_steps", [20, 40])
+    if not isinstance(diag_steps, list) or len(diag_steps) == 0:
+        diag_steps = [20, 40]
+    diag_steps = [int(s) for s in diag_steps]
+    diag_step_set = set(diag_steps)
+    print(f"[Diag] diag_steps={diag_steps}")
 
-    # ------------------------------
-    # (Condition-3) 되돌릴 수 없는 선택: switch_cost
-    #   - 직전 step의 action과 다르면 loss에 switch_cost 가산
-    # ------------------------------
-    switch_cost = float(cfg_tools.get("train", {}).get("switch_cost", 0.0))
+    p_hybrid_when_multi = float(cfg_tools.get("train", {}).get("p_hybrid_when_multi", 0.7))
+    p_force_desnow_in_multi = float(cfg_tools.get("train", {}).get("p_force_desnow_in_multi", 0.3))
 
-    # ------------------------------
-    # (NEW) Action-Contrastive Loss
-    #   loss = L_rec + lambda_contrast * |f_a(x) - f_a'(x)|_1
-    #   - a'는 negative action 1개만 샘플
-    # ------------------------------
-    lambda_contrast = float(cfg_tools.get("train", {}).get("lambda_contrast", 0.0))
-    contrast_warmup_steps = int(cfg_tools.get("train", {}).get("contrast_warmup_steps", 0))
-    contrast_every = int(cfg_tools.get("train", {}).get("contrast_every", 1))  # 매 step 계산하면 비용↑, N step마다 적용 가능
+    balance_cycle = build_cycle_actions(cfg_tools)
+
+    lambda_silence = float(cfg_tools.get("train", {}).get("lambda_silence", 0.0))
+    silence_warmup_steps = int(cfg_tools.get("train", {}).get("silence_warmup_steps", 0))
+    silence_every = int(cfg_tools.get("train", {}).get("silence_every", 1))
+
+    gate_cfg = cfg_tools.get("train", {}).get("action_gate", {}) if isinstance(cfg_tools.get("train", {}), dict) else {}
+    gate_init = float(gate_cfg.get("init", 0.9))
+    gate_clamp_min = float(gate_cfg.get("clamp_min", 0.0))
+    gate_clamp_max = float(gate_cfg.get("clamp_max", 1.0))
+    gate_lr_scale = float(gate_cfg.get("lr_scale", 1.0))
+
+    amp_cfg = cfg_tools.get("train", {}).get("amp_cfg", {}) if isinstance(cfg_tools.get("train", {}), dict) else {}
+    scaler_init_scale = float(amp_cfg.get("init_scale", 2**12))
+    scaler_growth_interval = int(amp_cfg.get("growth_interval", 200))
+
+    lr = float(cfg_tools["train"]["lr"])
+    weight_decay = float(cfg_tools["train"].get("weight_decay", 0.0))
+    betas = cfg_tools["train"].get("betas", [0.9, 0.999])
+    betas = (float(betas[0]), float(betas[1]))
+    grad_clip = float(cfg_tools["train"].get("grad_clip", 0.0))
+    use_amp = bool(cfg_tools["train"].get("amp", True))
 
     # Dataset
     tfm = PairedTransform(cfg_ds["train_patch"]["patch_size"])
@@ -333,36 +631,93 @@ def main():
     # Model
     backbone = VETNet(dim=48, volterra_rank=4).to(device)
     adapter_specs = {a: AdapterSpec(**s) for a, s in cfg_tools["toolbank"]["adapters"].items()}
-    toolbank = ToolBank(backbone, adapter_specs, device=device, debug=True).to(device)
+
+    # ToolBank + ActionGate
+    toolbank = ToolBankWithActionGate(
+        backbone,
+        adapter_specs,
+        device=device,
+        debug=True,
+        gate_actions=[A_DEDROP, A_DEBLUR, A_DERAIN, A_DESNOW, A_DEHAZE, A_HYBRID],
+        gate_init=gate_init,
+        gate_clamp=(gate_clamp_min, gate_clamp_max),
+    ).to(device)
 
     # Freeze backbone (LoRA만 학습)
-    for p in toolbank.backbone.parameters():
-        p.requires_grad = False
+    if bool(cfg_tools.get("toolbank", {}).get("freeze_backbone", True)):
+        for p in toolbank.backbone.parameters():
+            p.requires_grad = False
 
-    trainable = collect_lora_params(toolbank)
-    print(f"[Trainable LoRA] {sum(p.numel() for p in trainable)/1e6:.2f} M params")
+    # Trainables: LoRA + ActionGate params
+    trainable_lora = collect_lora_params(toolbank)
+    trainable_gate = list(toolbank.action_gate.parameters())
+    for p in trainable_gate:
+        p.requires_grad = True
 
-    optimizer = torch.optim.AdamW(trainable, lr=cfg_tools["train"]["lr"])
-    scaler = GradScaler("cuda")
+    lora_numel = sum(p.numel() for p in trainable_lora)
+    gate_numel = sum(p.numel() for p in trainable_gate)
+    print(f"[Trainable LoRA] {lora_numel/1e6:.2f} M params ({lora_numel} params)")
+    print(f"[Trainable Gate] {gate_numel} params")
 
-    # Training
+    # Optimizer (param groups so gate can have separate lr if needed)
+    param_groups = [{"params": trainable_lora, "lr": lr}]
+    if len(trainable_gate) > 0:
+        param_groups.append({"params": trainable_gate, "lr": lr * gate_lr_scale})
+
+    optimizer = torch.optim.AdamW(param_groups, lr=lr, betas=betas, weight_decay=weight_decay)
+    scaler = GradScaler("cuda", init_scale=scaler_init_scale, growth_interval=scaler_growth_interval) if use_amp else None
+
+    # Action param cache + θ0 snapshot
+    action_param_cache = build_action_param_cache(toolbank)
+    theta0_snapshot = build_action_theta0_snapshot_fp16(action_param_cache)
+    print("[SilenceΔθ] snapshot(theta0) captured (fp16, cpu).")
+
+    # DIAG A) optimizer coverage check (ONCE at init)
+    diag_optimizer_lora_coverage_once(
+        toolbank=toolbank,
+        trainable_lora=trainable_lora,
+        optimizer=optimizer,
+        action_param_cache=action_param_cache,
+        k_print=5,
+    )
+
+    # DIAG 2) pick params + snapshot (per-action 1개씩)
+    diag_actions = [A_DEDROP, A_DEBLUR, A_DERAIN, A_DESNOW, A_DEHAZE, A_HYBRID]
+    diag_picks = diag_pick_params(action_param_cache, diag_actions, k_per_action=1)
+    diag_snap: Dict[str, List[torch.Tensor]] = {}
+    for a, ps in diag_picks.items():
+        diag_snap[a] = [p.detach().clone().to("cpu", dtype=torch.float32) for p in ps]
+    print("[DIAG] picked params per action:", {k: len(v) for k, v in diag_picks.items()})
+
+    # Training cfg
     save_dir = cfg_tools["paths"]["ckpt_dir"]
     os.makedirs(save_dir, exist_ok=True)
 
     epochs = int(cfg_tools["train"]["epochs"])
-    save_every = int(cfg_tools["train"].get("save_every", 2000))
+
+    print(f"[Train] batch_size={cfg_ds['loader']['batch_size']} epochs={epochs} lr={lr} seed={cfg_ds.get('mixed', {}).get('seed', 123)}")
+    print(f"[OraclePolicy] p_hybrid_when_multi={p_hybrid_when_multi} p_force_desnow_in_multi={p_force_desnow_in_multi}")
+    print(f"[ActionBalance] cycle={balance_cycle}")
+    print(f"[SilenceΔθ] lambda_silence={lambda_silence} warmup={silence_warmup_steps} every={silence_every}")
+    print(f"[ActionGate] init={gate_init} clamp=[{gate_clamp_min},{gate_clamp_max}] lr_scale={gate_lr_scale}")
+    print(f"[AMP] use_amp={use_amp} scaler_init_scale={scaler_init_scale} growth_interval={scaler_growth_interval}")
+    print(f"[Sanity] sanity_every={sanity_every} diff_every={diff_every} log_every={log_every}")
 
     global_step = 0
     toolbank.train()
 
-    # epoch별 action 통계/손실 누적
     action_loss_sum: DefaultDict[str, float] = defaultdict(float)
     action_count: DefaultDict[str, int] = defaultdict(int)
+    action_seen: DefaultDict[str, int] = defaultdict(int)
 
-    # (Condition-3) 직전 action tracking
     prev_action: str = A_STOP
-
     t0 = time.time()
+
+    steps_per_epoch = len(loader)
+    print(f"[Train] steps_per_epoch={steps_per_epoch} (MixedDataset.__len__)")
+
+    cycle_idx = 0
+    sanity_actions = [A_DEDROP, A_DEBLUR, A_DERAIN, A_DESNOW, A_DEHAZE, A_HYBRID]
 
     for epoch in range(epochs):
         total = 0.0
@@ -371,139 +726,184 @@ def main():
 
         pbar = tqdm(loader, ncols=120)
 
-        for batch in pbar:
+        for it, batch in enumerate(pbar, start=1):
             global_step += 1
 
             x = batch["input"].to(device, non_blocking=True)
             gt = batch["gt"].to(device, non_blocking=True)
 
-            # 배치 각 샘플의 oracle action
-            oracle_actions = [choose_oracle_action(m["degradations"]) for m in batch["meta"]]
-            # 현재 step에서 사용할 action (다수결)
-            action = max(set(oracle_actions), key=oracle_actions.count)
+            oracle_actions = [
+                choose_oracle_action(
+                    m["degradations"],
+                    p_hybrid_when_multi=p_hybrid_when_multi,
+                    p_force_desnow_in_multi=p_force_desnow_in_multi,
+                )
+                for m in batch["meta"]
+            ]
+            oracle_major = max(set(oracle_actions), key=oracle_actions.count)
 
-            # (Condition-1) action 실패 손해: mismatch rate 기반 penalty
-            if action_specific_penalty > 0.0:
-                mismatch = sum(1 for a in oracle_actions if a != action)
-                mismatch_rate = float(mismatch) / float(max(1, len(oracle_actions)))
-                loss_pen_action = action_specific_penalty * mismatch_rate
+            action = balance_cycle[cycle_idx % len(balance_cycle)]
+            cycle_idx += 1
+
+            mismatch = sum(1 for a in oracle_actions if a != action)
+            mismatch_rate = float(mismatch) / float(max(1, len(oracle_actions)))
+            oracle_hist = defaultdict(int)
+            for a in oracle_actions:
+                oracle_hist[a] += 1
+
+            # Silence on/off
+            use_silence = (lambda_silence > 0.0)
+            if use_silence:
+                if not (global_step >= max(0, silence_warmup_steps) and (silence_every <= 1 or (global_step % silence_every == 0))):
+                    use_silence = False
+
+            # Forward + loss
+            if use_amp:
+                with autocast(device_type="cuda"):
+                    pred = toolbank.apply(x, action)
+                loss_rec = charbonnier_loss(pred.float(), gt.float())
+                loss = loss_rec
+                if use_silence:
+                    l_sil = silence_delta_theta_loss_mean(action_param_cache, theta0_snapshot, action)
+                    loss = loss + (loss_rec.new_tensor(lambda_silence) * l_sil)
             else:
-                mismatch_rate = 0.0
-                loss_pen_action = 0.0
-
-            # (Condition-3) switch cost: 되돌릴 수 없는 선택(전환 비용)
-            if switch_cost > 0.0 and prev_action != A_STOP and action != prev_action:
-                loss_pen_switch = switch_cost
-            else:
-                loss_pen_switch = 0.0
-
-            # (NEW) negative action 샘플 (contrast 계산 시 필요)
-            neg_action = None
-            use_contrast = (lambda_contrast > 0.0)
-            if use_contrast:
-                if global_step >= max(0, contrast_warmup_steps) and (contrast_every <= 1 or (global_step % contrast_every == 0)):
-                    neg_action = sample_negative_action(action, oracle_actions)
-                else:
-                    use_contrast = False  # warmup/every 조건 미충족이면 이번 step은 contrast off
-
-            with autocast(device_type="cuda"):
-                # main prediction
                 pred = toolbank.apply(x, action)
                 loss_rec = charbonnier_loss(pred, gt)
-
-                # 최종 loss = 복원 loss + (조건1) + (조건3) + (NEW contrast)
                 loss = loss_rec
+                if use_silence:
+                    l_sil = silence_delta_theta_loss_mean(action_param_cache, theta0_snapshot, action)
+                    loss = loss + (loss_rec.new_tensor(lambda_silence) * l_sil)
 
-                if loss_pen_action > 0.0:
-                    loss = loss + loss_rec.new_tensor(loss_pen_action)
-                if loss_pen_switch > 0.0:
-                    loss = loss + loss_rec.new_tensor(loss_pen_switch)
-
-                # (NEW) Action-Contrastive Loss (negative 1개)
-                # - 같은 x로 다른 action 출력도 계산 (추가 forward 1회)
-                loss_contrast_val = 0.0
-                if use_contrast and (neg_action is not None):
-                    # contrast는 1 sample만
-                    x_c = x[:1]
-                    pred_c = pred[:1]
-                    pred_neg = toolbank.apply(x_c, neg_action)
-                    l_con = torch.mean(torch.abs(pred_c - pred_neg))
-                    loss = loss + (loss_rec.new_tensor(lambda_contrast) * l_con)
-                    loss_contrast_val = float(l_con.detach().item())
-
+            # Backward / step
             optimizer.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
+            did_unscale = False
 
-            # ------------------------------
-            # SANITY 1) action별 grad norm (unscaled grad로 측정)
-            # ------------------------------
-            if sanity_every > 0 and (global_step % sanity_every == 0):
-                # unscale to read true grad magnitudes
-                scaler.unscale_(optimizer)
+            def ensure_unscale():
+                nonlocal did_unscale
+                if (not did_unscale) and use_amp:
+                    scaler.unscale_(optimizer)
+                    did_unscale = True
 
-                g_sel = lora_grad_norm_for_action(toolbank, action)
-                g_hyb = lora_grad_norm_for_action(toolbank, A_HYBRID) if action != A_HYBRID else 0.0
-                g_drop = lora_grad_norm_for_action(toolbank, A_DEDROP) if action != A_DEDROP else 0.0
-                g_blur = lora_grad_norm_for_action(toolbank, A_DEBLUR) if action != A_DEBLUR else 0.0
+            if use_amp:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
 
+            if grad_clip > 0:
+                if use_amp:
+                    ensure_unscale()
+                torch.nn.utils.clip_grad_norm_(list(trainable_lora) + list(trainable_gate), grad_clip)
+
+            # Decide diag/sanity/diff
+            force_diag = (global_step in diag_step_set)
+            do_sanity = (sanity_every > 0 and (global_step % sanity_every == 0))
+            do_diff = (diff_every > 0 and (global_step % diff_every == 0))
+
+            # DIAG 1) LoRA state scan BEFORE optimizer step
+            if force_diag:
+                print(f"[DIAG][lora_state][pre_step] step={global_step} action={action}\n{diag_scan_lora_modules(toolbank.backbone, limit=6)}")
+
+            # SANITY grad stats (after backward; before step)
+            if force_diag or do_sanity:
+                tag = "DIAG" if force_diag else "SANITY"
+                if use_amp:
+                    try:
+                        print(f"[{tag}][scaler] step={global_step} scale={scaler.get_scale():.1f}")
+                    except Exception:
+                        pass
+                    ensure_unscale()
+
+                max_g = 0.0
+                cnt = 0
+                for p in trainable_lora:
+                    if p.grad is not None:
+                        cnt += 1
+                        max_g = max(max_g, float(p.grad.detach().abs().max().item()))
+
+                print(f"[{tag}][grad_cnt] step={global_step} cnt={cnt}/{len(trainable_lora)}")
+                print(f"[{tag}][grad_max] step={global_step} max_abs_grad={max_g:.3e}")
+
+                g_sel = grad_norm_for_action_params(action_param_cache, action)
+                g_non = grad_norm_sum_except_params(action_param_cache, action, sanity_actions)
+                ratio = g_sel / (g_non + 1e-12)
+                gate_val_now = toolbank.get_gate_value(action)
                 print(
-                    f"[SANITY][grad] step={global_step} act={action} "
-                    f"g_sel={g_sel:.4f} g_hyb={g_hyb:.4f} g_drop={g_drop:.4f} g_blur={g_blur:.4f}"
+                    f"[{tag}][grad] step={global_step} sel={action} "
+                    f"g_sel={g_sel:.3e} sum_g_non_sel={g_non:.3e} ratio={ratio:.3e} gate={gate_val_now:.3f}"
                 )
 
-            # optimizer step
-            scaler.step(optimizer)
-            scaler.update()
+            # Optimizer step
+            if use_amp:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
 
-            # ------------------------------
-            # SANITY 2) 출력 차이(Stop 대비) - 가끔만
-            # ------------------------------
-            sep_score = None
-            if diff_every > 0 and (global_step % diff_every == 0):
+            # DIAG 2) param Δ after optimizer step
+            if force_diag or do_diff:
+                tag = "DIAG" if force_diag else "SANITY"
+                for a, ps in diag_picks.items():
+                    for i, p in enumerate(ps):
+                        w0 = diag_snap[a][i].to("cpu")
+                        w1 = p.detach().to("cpu", dtype=torch.float32)
+                        dw = (w1 - w0)
+                        n0, m0 = float(w0.norm().item()), float(w0.abs().max().item())
+                        nd, md = float(dw.norm().item()), float(dw.abs().max().item())
+                        print(
+                            f"[{tag}][paramΔ] step={global_step} act={a} idx={i} "
+                            f"|w0|={n0:.3e} max|w0|={m0:.3e} |Δ|={nd:.3e} max|Δ|={md:.3e}"
+                        )
+                        diag_snap[a][i] = w1.clone()
+
+            # DIAG/SANITY diff: Δout_vs_stop(mean/max/rms)
+            if force_diag or do_diff:
                 toolbank.eval()
                 with torch.no_grad():
-                    d_out = output_diff_vs_stop(toolbank, x, action)
-
-                    # (NEW) action separation score
-                    # - 이번 step에 neg_action이 없었으면(contrast off) 하드네거티브 하나 다시 샘플
-                    neg_for_sanity = neg_action if (neg_action is not None) else sample_negative_action(action, oracle_actions)
-                    sep_score = action_separation_score(toolbank, x, action, neg_for_sanity)
-
+                    stats = output_delta_stats_vs_stop(toolbank, x, action)
+                    tag = "DIAG" if force_diag else "SANITY"
+                    print(
+                        f"[{tag}][diff] step={global_step} act={action} "
+                        f"Δout_vs_stop(mean_abs)={stats['mean_abs']:.3e} "
+                        f"max_abs={stats['max_abs']:.3e} rms={stats['rms']:.3e}"
+                    )
                 toolbank.train()
-                print(f"[SANITY][diff] step={global_step} act={action} Δout_vs_stop={d_out:.6f}")
-                print(f"[SANITY][sep ] step={global_step} act={action} neg={neg_for_sanity} sep_score={sep_score:.4f}")
 
-            # loss/stat updates
-            loss_val = float(loss.item())
+            # stats
+            loss_val = float(loss.detach().item())
             total += loss_val
-            avg_loss = total / (pbar.n + 1)
+            avg_loss = total / float(it)
 
             action_loss_sum[action] += loss_val
             action_count[action] += 1
+            action_seen[action] += 1
 
             elapsed = time.time() - t0
-
-            # progress text (기존 출력 유지 + penalty/contrast 정보만 덧붙임)
-            # - 기존: loss, act, m, sw, t 유지
-            # - 추가: con(contrast L1)만 표시 (계산 안 한 step은 0.000)
             sw_flag = 1 if (prev_action != A_STOP and action != prev_action) else 0
-            pbar.set_description(
-                f"Epoch {epoch+1}/{epochs} | loss={avg_loss:.4f} | act={action} | "
-                f"m={mismatch_rate:.2f} | sw={sw_flag} | con={loss_contrast_val:.4f} | "
-                f"t={elapsed/60:.1f}m"
+            gate_val = toolbank.get_gate_value(action)
+
+            pbar.set_postfix(
+                {
+                    "loss": f"{avg_loss:.4f}",
+                    "act": action,
+                    "m": f"{mismatch_rate:.2f}",
+                    "sw": f"{sw_flag:d}",
+                    "gate": f"{gate_val:.2f}",
+                    "min": f"{elapsed/60:.1f}",
+                },
+                refresh=False,
             )
 
-            # Iteration checkpoint
-            if global_step % save_every == 0:
-                iter_path = os.path.join(save_dir, f"iter_{global_step}_loss{avg_loss:.4f}.pth")
-                torch.save({"toolbank": toolbank.state_dict(), "step": global_step}, iter_path)
-                print(f"[CKPT] Saved: {iter_path}")
+            if global_step == 1 or (global_step % log_every == 0):
+                tqdm.write(
+                    f"[BATCH][debug] epoch={epoch+1}/{epochs} it={it}/{steps_per_epoch} step={global_step} "
+                    f"target={action} oracle_major={oracle_major} mismatch={mismatch}/{len(oracle_actions)} "
+                    f"ok={(oracle_major==action)} gate={gate_val:.3f} oracle_hist={dict(oracle_hist)}"
+                )
 
-            # (Condition-3) prev_action 갱신 (step 끝에서 업데이트)
             prev_action = action
 
         # Epoch checkpoint
-        epoch_loss = total / max(1, len(loader))
+        epoch_loss = total / max(1, steps_per_epoch)
         ckpt_path = os.path.join(save_dir, f"epoch_{epoch+1:03d}_loss{epoch_loss:.4f}.pth")
         torch.save(
             {
@@ -516,17 +916,18 @@ def main():
         )
         print(f"[CKPT] Saved: {ckpt_path}")
 
-        # ------------------------------
-        # Epoch summary: action-wise loss
-        # ------------------------------
+        # Epoch summary
         print(f"[Epoch {epoch+1}] Action-wise mean loss:")
-        for a in [A_DEDROP, A_DEBLUR, A_DERAIN, A_DESNOW, A_DEHAZE, A_HYBRID]:
+        for a in sanity_actions:
             c = action_count.get(a, 0)
+            gv = toolbank.get_gate_value(a)
             if c > 0:
                 m = action_loss_sum[a] / c
-                print(f"  - {a:<8} : count={c:5d} mean_loss={m:.4f}")
+                print(f"  - {a:<8} : count={c:5d} mean_loss={m:.4f} gate={gv:.3f}")
             else:
-                print(f"  - {a:<8} : count=    0 mean_loss=NA")
+                print(f"  - {a:<8} : count=    0 mean_loss=NA gate={gv:.3f}")
+
+        print("[Seen so far]", {a: action_seen.get(a, 0) for a in sanity_actions})
 
     print("[Train] Done ✅")
 

@@ -1,4 +1,5 @@
-# configs/tools.yaml
+# E:\ReAct-IR\configs\tools.yaml
+
 toolbank:
   freeze_backbone: true
 
@@ -34,6 +35,7 @@ toolbank:
       dropout: 0.0
       runtime_scale: 1.0
 
+    # HYBRID는 "가벼운 혼합 전문가"로 두되, 학습 배치에서 강제 순회로 반드시 학습됨
     A_HYBRID:
       rank: 1
       alpha: 1.0
@@ -41,23 +43,61 @@ toolbank:
       runtime_scale: 0.8
 
 train:
-  lambda_contrast: 0.05       # ⭐ 핵심 (처음엔 0.05~0.1 추천)
-  contrast_warmup_steps: 0    # 처음부터 켜기
-  contrast_every: 20           # 매 step 적용
+  # -------------------------------
+  # Action 균형 샘플링 (NEW)
+  # -------------------------------
+  # train_toolbank.py의 ActionBalancedBatcher가 이 값을 사용
+  target_action_cycle: [A_DEDROP, A_DEBLUR, A_DERAIN, A_DESNOW, A_DEHAZE, A_HYBRID]
+  max_tries_per_batch: 20000
 
-  lr: 0.0002
+  # -------------------------------
+  # Oracle 규칙 (NEW)
+  # -------------------------------
+  # multi-degradation에서 HYBRID/DESNOW 활성화
+  p_hybrid_when_multi: 0.70
+  p_force_desnow_in_multi: 0.30
+
+  # -------------------------------
+  # Δθ silent penalty (NEW, 핵심)
+  # -------------------------------
+  lambda_silence: 1.0e-7
+  silence_warmup_steps: 0
+  silence_every: 1
+
+  # -------------------------------
+  # 기존 학습 하이퍼파라미터
+  # -------------------------------
+  lr: 2.0e-4
   weight_decay: 0.0
   betas: [0.9, 0.999]
 
   epochs: 20
   grad_clip: 1.0
-
   amp: true
+
+  # -------------------------------
+  # 로깅/세이브/디버그 주기
+  # -------------------------------
   sanity_every: 20
-  diff_every: 50
-  log_every: 50
+  diff_every: 20
+
+  # train_toolbank.py에서 사용하는 출력 제어(NEW)
+  # - 너무 출력이 많으면 값을 키우면 됨
+  print_every: 50
+  pbar_every: 10
+
+  # save_every: "step 단위" 저장 주기 (iter_*.pth)
   save_every: 250
   save_best: true
+
+  # 아래 항목들은 train_toolbank.py에서 '선택적'으로 사용
+  # (필요 없으면 0으로)
+  action_specific_penalty: 0.0
+  switch_cost: 0.0
+
+  # 이어학습 옵션 (필요하면 경로 입력)
+  resume_ckpt: ""
+  resume_optimizer: false
 
 paths:
   ckpt_dir: "E:/ReAct-IR/checkpoints/toolbank"
