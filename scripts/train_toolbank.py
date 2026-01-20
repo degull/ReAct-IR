@@ -562,11 +562,11 @@ def main():
     print(f"[Trainable LoRA] {lora_numel/1e6:.2f} M params ({lora_numel} params)")
 
     optimizer = torch.optim.AdamW(
-        [{"params": trainable_lora, "lr": lr}],
-        lr=lr,
+        [{"params": trainable_lora, "lr": lr, "weight_decay": 0.0}],
         betas=betas,
-        weight_decay=weight_decay,
+        weight_decay=0.0,
     )
+
     scaler = GradScaler("cuda", init_scale=scaler_init_scale, growth_interval=scaler_growth_interval) if use_amp else None
 
     # Action param cache + θ0 snapshot
@@ -731,6 +731,7 @@ def main():
             # DIAG 2) param Δ after optimizer step
             if force_diag or do_diff:
                 tag = "DIAG" if force_diag else "SANITY"
+                
                 for a, ps in diag_picks.items():
                     for i, p in enumerate(ps):
                         w0 = diag_snap[a][i].to("cpu")

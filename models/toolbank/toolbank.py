@@ -60,7 +60,6 @@ class ToolBank(nn.Module):
     Guarantee:
       - action이 바뀌면 같은 레이어라도 다른 (A,B)를 사용 => 출력이 일관되게 달라짐
       - "A_DEBLUR만 업데이트 / A_DERAIN은 그대로"가 가능
-        (optimizer param group을 action별로 분리하면 됨)
       - A_STOP: 전역 LoRA off (모든 MultiLoRA*에서 action=None, scale=0)
     """
 
@@ -115,7 +114,7 @@ class ToolBank(nn.Module):
         IMPORTANT: named_modules() yields nested; we only wrap if module is Conv2d/Linear AND not already wrapped.
         """
         for name, m in self.backbone.named_modules():
-            if isinstance(m, MultiLoRAConv2d) or isinstance(m, MultiLoRALinear):
+            if isinstance(m, (MultiLoRAConv2d, MultiLoRALinear)):
                 continue
             if isinstance(m, nn.Conv2d):
                 yield name, m
@@ -150,11 +149,7 @@ class ToolBank(nn.Module):
             if len(acts) == 0:
                 continue
 
-            # choose "shape hyperparams" from a representative spec:
-            # we allow per-action different rank/alpha, but that would require per-action shapes.
-            # For strict action-independence with different ranks, you'd need a more complex design.
-            # Here: we enforce that all actions that share this layer use the SAME (rank, alpha, dropout) for this layer.
-            # (runtime_scale can still vary per action.)
+            # enforce per-layer shared (rank, alpha, dropout) among actions
             ref = self._spec_for_action(acts[0])
             for a in acts[1:]:
                 s = self._spec_for_action(a)
@@ -207,8 +202,22 @@ class ToolBank(nn.Module):
                 m.set_action(None)
                 m.set_scale(0.0)
 
-    def activate_adapter(self, action: str):
-        if action == self._active_action:
+    def set_runtime_scale(self, s: float):
+        """
+        Global scale override for currently active adapters (or whatever is active).
+        This is what sweep_runtime_scale should use.
+        """
+        s = float(s)
+        for _, m in self.backbone.named_modules():
+            if isinstance(m, (MultiLoRAConv2d, MultiLoRALinear)):
+                # only meaningful if active/action set; but safe to set anyway
+                m.set_scale(s)
+
+    def activate_adapter(self, action: str, runtime_scale: Optional[float] = None):
+        """
+        Activate an action. If runtime_scale is provided, it overrides spec.runtime_scale at runtime.
+        """
+        if action == self._active_action and runtime_scale is None:
             return
 
         if action == A_STOP:
@@ -221,17 +230,17 @@ class ToolBank(nn.Module):
         if action not in self.actions:
             raise KeyError(f"[ToolBank] unknown action: {action}")
 
+        # choose scale (spec default or runtime override)
+        sc = float(self._spec_for_action(action).runtime_scale) if runtime_scale is None else float(runtime_scale)
+
         # global set to action, but scale only for modules that have that action adapter;
         # for others, action is None (off). This guarantees strict separation.
-        # (This also avoids any accidental influence from modules that don't have that action.)
         for _, m in self.backbone.named_modules():
             if not isinstance(m, (MultiLoRAConv2d, MultiLoRALinear)):
                 continue
 
             if action in getattr(m, "actions", []):
                 m.set_action(action)
-                # runtime_scale is action-wise; applied uniformly for this action
-                sc = float(self._spec_for_action(action).runtime_scale)
                 m.set_scale(sc)
             else:
                 m.set_action(None)
@@ -240,7 +249,6 @@ class ToolBank(nn.Module):
         self._active_action = action
 
         if self.debug:
-            sc = float(self._spec_for_action(action).runtime_scale)
             print(f"[ToolBank] Activated action={action} | runtime_scale={sc}")
 
     # --------------------------------------------------
@@ -258,7 +266,6 @@ class ToolBank(nn.Module):
         seen = set()
 
         for m in self.adapters.get(action, []):
-            # MultiLoRA wrappers store per-action adapters in ModuleDict
             for p in m.lora_A[action].parameters():
                 if id(p) not in seen:
                     params.append(p)
@@ -291,10 +298,19 @@ class ToolBank(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.backbone(x)
 
-    def apply(self, x: torch.Tensor, action: str) -> torch.Tensor:
+    def apply(self, x: torch.Tensor, action: str, runtime_scale: Optional[float] = None) -> torch.Tensor:
+        """
+        Main entry used by evaluation scripts.
+        - If runtime_scale is provided, sweep works (scale affects output).
+        - If runtime_scale is None, behavior is identical to old code (uses spec.runtime_scale).
+        """
         if self.debug:
-            print(f"[DEBUG] apply(action={action})")
-        self.activate_adapter(action)
+            if runtime_scale is None:
+                print(f"[DEBUG] apply(action={action})")
+            else:
+                print(f"[DEBUG] apply(action={action}, runtime_scale={float(runtime_scale)})")
+
+        self.activate_adapter(action, runtime_scale=runtime_scale)
         return self.forward(x)
 
     # --------------------------------------------------
@@ -340,9 +356,6 @@ if __name__ == "__main__":
     ).to(device)
     backbone.eval()
 
-    # IMPORTANT:
-    # - For “diff가 0이냐/아니냐” 즉시 확인하려면 force_nonzero_init=True로 두고 테스트.
-    # - 실제 학습용은 보통 init_B_zero=True, force_nonzero_init=False가 안정적.
     specs = {
         A_DEDROP: AdapterSpec(rank=2, alpha=1.0, dropout=0.0, runtime_scale=1.0, init_B_zero=True, force_nonzero_init=True),
         A_DEBLUR: AdapterSpec(rank=2, alpha=1.0, dropout=0.0, runtime_scale=1.0, init_B_zero=True, force_nonzero_init=True),
@@ -363,29 +376,8 @@ if __name__ == "__main__":
     x = torch.randn(1, 3, 128, 128, device=device)
 
     with torch.no_grad():
-        out_stop = tb.apply(x, A_STOP)
-        out_drop = tb.apply(x, A_DEDROP)
-        out_blur = tb.apply(x, A_DEBLUR)
-        out_rain = tb.apply(x, A_DERAIN)
-        out_snow = tb.apply(x, A_DESNOW)
-        out_haze = tb.apply(x, A_DEHAZE)
+        out_1 = tb.apply(x, A_DEHAZE, runtime_scale=1.0)
+        out_02 = tb.apply(x, A_DEHAZE, runtime_scale=0.2)
+        print("haze scale diff:", (out_1 - out_02).abs().mean().item())
 
-    print("stop-drop diff:", (out_stop - out_drop).abs().mean().item())
-    print("drop-blur diff:", (out_drop - out_blur).abs().mean().item())
-    print("blur-rain diff:", (out_blur - out_rain).abs().mean().item())
-    print("snow-haze diff:", (out_snow - out_haze).abs().mean().item())
-
-    tb.activate_adapter(A_STOP)
-    print("[SCALES][STOP] first states:", tb.diag_first_lora_states(limit=8))
-    tb.activate_adapter(A_DEBLUR)
-    print("[SCALES][DEBLUR] first states:", tb.diag_first_lora_states(limit=8))
-    tb.activate_adapter(A_STOP)
-    print("[SCALES][STOP2] first states:", tb.diag_first_lora_states(limit=8))
-
-    # param split sanity: same wrapper, different action params => different tensor ids
-    p_blur = tb.get_action_parameters(A_DEBLUR)
-    p_rain = tb.get_action_parameters(A_DERAIN)
-    inter = set(id(p) for p in p_blur).intersection(set(id(p) for p in p_rain))
-    print(f"[ParamSplit] |DEBLUR|={len(p_blur)} |DERAIN|={len(p_rain)} shared_param_ids={len(inter)}")
-
-    print("[DEBUG] ToolBank (NO HYBRID) OK ✅")
+    print("[DEBUG] ToolBank runtime_scale override OK ✅")

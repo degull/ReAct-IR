@@ -60,7 +60,7 @@ train:
   # -------------------------------
   # Δθ silent penalty (NEW, 핵심)
   # -------------------------------
-  lambda_silence: 1.0e-7
+  lambda_silence: 0.0
   silence_warmup_steps: 0
   silence_every: 1
 
@@ -71,7 +71,7 @@ train:
   weight_decay: 0.0
   betas: [0.9, 0.999]
 
-  epochs: 20
+  epochs: 50
   grad_clip: 1.0
   amp: true
 
