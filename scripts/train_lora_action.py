@@ -630,17 +630,59 @@ if __name__ == "__main__":
 Examples (PowerShell):
 
 # DESNOW
-python e:/ReAct-IR/scripts/train_lora_action.py `
-  --action desnow `
-  --backbone_ckpt "E:/ReAct-IR/checkpoints/backbone/epoch_019_L0.0230_P30.61_S0.9292.pth" `
-  --data_root "E:/ReAct-IR/data" `
-  --save_root "E:/ReAct-IR/checkpoints/toolbank_lora" `
-  --results_root "E:/ReAct-IR/results/lora_train" `
-  --epochs 20 --batch_size 1 --patch 256 --lr 3e-4 `
-  --lora_rank 2 --lora_alpha 1.0 --use_amp 1 `
-  --iter_save_interval 300 --metric_every 200
-
+python -u e:/ReAct-IR/scripts/train_lora_action.py `
+   --action desnow `
+   --backbone_ckpt "E:/ReAct-IR/checkpoints/backbone/epoch_019_L0.0230_P30.61_S0.9292.pth" `
+   --data_root "E:/ReAct-IR/data" `
+   --save_root "E:/ReAct-IR/checkpoints/toolbank_lora" `
+   --results_root "E:/ReAct-IR/results/lora_train" `
+   --epochs 20 --batch_size 1 --patch 256 --lr 3e-4 `
+   --lora_rank 2 --lora_alpha 1.0 --use_amp 1 `
+   --iter_save_interval 300 --metric_every 200
+ 
 # DEDROP
-python e:/ReAct-IR/scripts/train_lora_action.py --action dedrop ...
+python -u e:/ReAct-IR/scripts/train_lora_action.py `
+   --action dedrop `
+   --backbone_ckpt "E:/ReAct-IR/checkpoints/backbone/epoch_019_L0.0230_P30.61_S0.9292.pth" `
+   --data_root "E:/ReAct-IR/data" `
+   --save_root "E:/ReAct-IR/checkpoints/toolbank_lora" `
+   --results_root "E:/ReAct-IR/results/lora_train" `
+   --epochs 20 --batch_size 1 --patch 256 --lr 3e-4 `
+   --lora_rank 2 --lora_alpha 1.0 --use_amp 1 `
+   --iter_save_interval 300 --metric_every 200
 
+# DERAIN
+python -u e:/ReAct-IR/scripts/train_lora_action.py `
+   --action derain `
+   --backbone_ckpt "E:/ReAct-IR/checkpoints/backbone/epoch_019_L0.0230_P30.61_S0.9292.pth" `
+   --data_root "E:/ReAct-IR/data" `
+   --save_root "E:/ReAct-IR/checkpoints/toolbank_lora" `
+   --results_root "E:/ReAct-IR/results/lora_train" `
+   --epochs 20 --batch_size 1 --patch 256 --lr 3e-4 `
+   --lora_rank 2 --lora_alpha 1.0 --use_amp 1 `
+   --iter_save_interval 300 --metric_every 200
+
+
+# DEHAZE
+python -u e:/ReAct-IR/scripts/train_lora_action.py `
+   --action dehaze `
+   --backbone_ckpt "E:/ReAct-IR/checkpoints/backbone/epoch_019_L0.0230_P30.61_S0.9292.pth" `
+   --data_root "E:/ReAct-IR/data" `
+   --save_root "E:/ReAct-IR/checkpoints/toolbank_lora" `
+   --results_root "E:/ReAct-IR/results/lora_train" `
+   --epochs 20 --batch_size 1 --patch 256 --lr 3e-4 `
+   --lora_rank 2 --lora_alpha 1.0 --use_amp 1 `
+   --iter_save_interval 300 --metric_every 200
+
+
+# DEBLUR
+python -u e:/ReAct-IR/scripts/train_lora_action.py `
+   --action deblur `
+   --backbone_ckpt "E:/ReAct-IR/checkpoints/backbone/epoch_019_L0.0230_P30.61_S0.9292.pth" `
+   --data_root "E:/ReAct-IR/data" `
+   --save_root "E:/ReAct-IR/checkpoints/toolbank_lora" `
+   --results_root "E:/ReAct-IR/results/lora_train" `
+   --epochs 20 --batch_size 1 --patch 256 --lr 3e-4 `
+   --lora_rank 2 --lora_alpha 1.0 --use_amp 1 `
+   --iter_save_interval 300 --metric_every 200
 """
