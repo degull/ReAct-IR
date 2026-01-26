@@ -168,29 +168,23 @@ def load_lora_state_dict_for_action(tb: ToolBank, action: str, sd: Dict[str, tor
       - tb.load_lora_state_dict_for_action(action, sd)
       - tb.load_lora_state_dict(action, sd)
 
-    Fallback (works with current ToolBank that only provides lora_state_dict):
-      - directly tb.load_state_dict(sd, strict=False) assuming sd keys are full module paths.
+    Fallback:
+      - tb.load_state_dict(sd, strict=False) assuming sd keys are full module paths.
     """
-    # Preferred APIs (if present)
     if hasattr(tb, "load_lora_state_dict_for_action"):
         return tb.load_lora_state_dict_for_action(action, sd, strict=strict)
     if hasattr(tb, "load_lora_state_dict"):
         return tb.load_lora_state_dict(action, sd, strict=strict)
 
-    # Fallback: sd should already be "full keys" suitable for tb.load_state_dict
     missing, unexpected = tb.load_state_dict(sd, strict=False)
 
-    # strict 의미를 최대한 반영
     if strict and (len(unexpected) > 0):
         raise RuntimeError(
             f"Unexpected keys while loading LoRA state_dict (strict=True). "
             f"unexpected={unexpected[:10]} (total {len(unexpected)})"
         )
 
-    # missing은 ToolBank 전체 state_dict를 로드하는 게 아니므로 일부 missing은 정상일 수 있음
-    # (특히 base/backbone weight는 sd에 없기 때문)
     return {"missing": missing, "unexpected": unexpected}
-
 
 
 def state_dict_stats(sd: Dict[str, torch.Tensor]) -> Tuple[int, float]:
@@ -339,12 +333,10 @@ def one_step_loss_decrease_check(
     tb.train()
     tb.activate(action_internal, scale=1.0)
 
-    # loss before
     with torch.no_grad():
         pred0 = _forward_one(tb, action_internal, x, amp=use_amp)
         loss0 = float(F.l1_loss(pred0, y).item())
 
-    # 1 step update
     opt.zero_grad(set_to_none=True)
     with autocast(device_type="cuda", dtype=torch.float16, enabled=(use_amp and x.is_cuda)):
         pred = tb(x)
@@ -354,7 +346,6 @@ def one_step_loss_decrease_check(
     scaler.update()
     opt.zero_grad(set_to_none=True)
 
-    # loss after (same batch)
     with torch.no_grad():
         pred1 = _forward_one(tb, action_internal, x, amp=use_amp)
         loss1 = float(F.l1_loss(pred1, y).item())
@@ -378,7 +369,6 @@ def save_reload_diff_check(
     sd = lora_state_dict_for_action(tb, action_internal)
     tensors, elems_m = state_dict_stats(sd)
 
-    # build a fresh model+toolbank and reload
     base2 = VETNet(**base_model_ctor_kwargs)
     _ = load_backbone_ckpt(base2, cfg.backbone_ckpt)
     freeze_all(base2)
@@ -417,7 +407,6 @@ def main():
     print("[Device]", device)
     print("[SKIMAGE]", "ON" if USE_SKIMAGE else "OFF")
 
-    # speed knobs
     torch.backends.cudnn.benchmark = True
     if cfg.tf32 and device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -456,7 +445,7 @@ def main():
     print(f"[Train] steps_per_epoch={steps_per_epoch} batch={cfg.batch_size}")
 
     # ---------------- model + toolbank ----------------
-    base_ctor = dict(dim=48, bias=False, volterra_rank=4)  # keep consistent with your vetnet default unless changed
+    base_ctor = dict(dim=48, bias=False, volterra_rank=4)
     base = VETNet(**base_ctor)
     ckpt_info = load_backbone_ckpt(base, cfg.backbone_ckpt)
     print("[Backbone] ckpt =", ckpt_info["ckpt_path"])
@@ -479,23 +468,19 @@ def main():
     if cfg.channels_last and device.type == "cuda":
         tb = tb.to(memory_format=torch.channels_last)
 
-    # verify injected count if available
     if hasattr(tb, "summary"):
         s = tb.summary()
         print(f"[ToolBank] injected LoRA into {s.get('wrapped_layers','?')} convs (expect ~179)")
     else:
         print("[ToolBank] injected (summary() not available)")
 
-    # trainable params before enabling action
     tp0 = count_trainable_params(tb)
     print(f"[DEBUG] trainable_params(before set_trainable_action)={tp0:.6f}M (expect 0.0M)")
 
-    # enable this action
     tb.set_trainable_action(cfg.action_internal)
     tp1 = count_trainable_params(tb)
     print(f"[DEBUG] trainable_params(after set_trainable_action) ={tp1:.6f}M (expect ~0.23M)")
 
-    # optimizer on trainable params only
     trainable = [p for p in tb.parameters() if p.requires_grad]
     if len(trainable) == 0:
         raise RuntimeError("No trainable params found after set_trainable_action().")
@@ -503,14 +488,13 @@ def main():
     opt = torch.optim.AdamW(trainable, lr=cfg.lr, weight_decay=cfg.weight_decay)
     scaler = GradScaler(enabled=(cfg.use_amp and device.type == "cuda"))
 
-    # output dirs
     save_dir = os.path.join(cfg.save_root, cfg.action_alias)
     res_dir = os.path.join(cfg.results_root, cfg.action_alias)
     safe_makedirs(save_dir)
     safe_makedirs(res_dir)
     safe_makedirs(os.path.join(res_dir, "iter"))
 
-    # ---------------- __main__ debug checks: one batch ----------------
+    # ---------------- debug checks: one batch ----------------
     x_dbg, y_dbg, meta_dbg = next(iter(loader))
     if cfg.channels_last and device.type == "cuda":
         x_dbg = x_dbg.to(device, non_blocking=True).to(memory_format=torch.channels_last)
@@ -523,7 +507,6 @@ def main():
         print("\n[DEBUG] one-step loss decrease check (same batch)")
         out = one_step_loss_decrease_check(tb, cfg.action_internal, opt, scaler, x_dbg, y_dbg, cfg.use_amp)
         print(f"  loss_before={out['loss_before']:.6f}  loss_after={out['loss_after']:.6f}  delta={out['delta']:.6f}")
-        # not guaranteed to decrease always, but usually should
         print("  decreased =", (out["loss_after"] <= out["loss_before"]))
 
         print("\n[DEBUG] save->reload diff check (same input)")
@@ -532,8 +515,6 @@ def main():
 
     # ---------------- training loop ----------------
     print("\n[Train] start")
-    global_step = 0
-
     for epoch in range(1, cfg.epochs + 1):
         tb.train()
         tb.activate(cfg.action_internal, scale=cfg.lora_scale_train)
@@ -547,8 +528,6 @@ def main():
         pbar = tqdm(loader, ncols=140, desc=f"Epoch {epoch:03d}/{cfg.epochs}")
 
         for it, (inp, gt, metas) in enumerate(pbar, start=1):
-            global_step += 1
-
             if cfg.channels_last and device.type == "cuda":
                 inp = inp.to(device, non_blocking=True).to(memory_format=torch.channels_last)
                 gt = gt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
@@ -567,15 +546,12 @@ def main():
             scaler.update()
 
             loss_sum += float(loss.item())
-
             pred_c = pred.detach().clamp(0, 1)
 
-            # preview save
             if cfg.iter_save_interval > 0 and (it % cfg.iter_save_interval == 0):
                 outp = os.path.join(res_dir, "iter", f"epoch_{epoch:03d}_iter_{it:05d}.png")
                 save_triplet(inp[0].detach().cpu(), pred_c[0].cpu(), gt[0].detach().cpu(), outp)
 
-            # metrics (slow) on 1 image
             if USE_SKIMAGE and cfg.metric_every > 0 and (it % cfg.metric_every == 0 or it == steps_per_epoch):
                 ps, ss = compute_psnr_ssim_1(pred_c[0].cpu(), gt[0].cpu())
                 psnr_sum += ps
@@ -603,9 +579,10 @@ def main():
         epoch_ssim = (ssim_sum / metric_cnt) if metric_cnt > 0 else 0.0
         print(f"\n[Epoch {epoch:03d}] Loss={epoch_loss:.6f}  PSNR={epoch_psnr:.2f}  SSIM={epoch_ssim:.4f}  time={format_time(time.time()-t0)}")
 
-        # save LoRA only
+        # ---------------- save LoRA only (filename: epoch_004_L0.0367_P27.24_S0.8868.pth) ----------------
         sd = lora_state_dict_for_action(tb, cfg.action_internal)
         tensors, elems_m = state_dict_stats(sd)
+
         ckpt = {
             "action_alias": cfg.action_alias,
             "action_internal": cfg.action_internal,
@@ -613,9 +590,18 @@ def main():
             "lora_rank": cfg.lora_rank,
             "lora_alpha": cfg.lora_alpha,
             "lora_state_dict": sd,
+            "metrics": {
+                "loss": float(epoch_loss),
+                "psnr": float(epoch_psnr),
+                "ssim": float(epoch_ssim),
+                "metric_cnt": int(metric_cnt),
+                "use_skimage": bool(USE_SKIMAGE),
+            },
             "cfg": vars(cfg),
         }
-        ckpt_path = os.path.join(save_dir, f"epoch_{epoch:03d}.pth")
+
+        ckpt_name = f"epoch_{epoch:03d}_L{epoch_loss:.4f}_P{epoch_psnr:.2f}_S{epoch_ssim:.4f}.pth"
+        ckpt_path = os.path.join(save_dir, ckpt_name)
         torch.save(ckpt, ckpt_path)
         print(f"[Save] {ckpt_path}  (tensors={tensors} elems={elems_m:.6f}M)")
 
@@ -624,6 +610,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 """
@@ -658,7 +645,7 @@ python -u e:/ReAct-IR/scripts/train_lora_action.py `
    --data_root "E:/ReAct-IR/data" `
    --save_root "E:/ReAct-IR/checkpoints/toolbank_lora" `
    --results_root "E:/ReAct-IR/results/lora_train" `
-   --epochs 20 --batch_size 1 --patch 256 --lr 3e-4 `
+   --epochs 20 --batxwcize 1 --patch 256 --lr 3e-4 `
    --lora_rank 2 --lora_alpha 1.0 --use_amp 1 `
    --iter_save_interval 300 --metric_every 200
 
