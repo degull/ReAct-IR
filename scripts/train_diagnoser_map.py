@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import math
 import argparse
 import random
 from dataclasses import dataclass
@@ -24,16 +25,12 @@ PROJECT_ROOT = os.path.abspath(os.path.join(CUR_DIR, ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from datasets.lora_dataset import (
-    ActionPairConfig,
-    build_action_pairs,
-    LoRAPairedDataset,
-)
+from datasets.lora_dataset import ActionPairConfig, build_action_pairs
 
 # ============================================================
-# Labels / mapping
+# Label / Action mapping
 # ============================================================
-# label order: [blur, rain, snow, haze, drop]
+ACTIONS_INTERNAL = ["A_DEBLUR", "A_DERAIN", "A_DESNOW", "A_DEHAZE", "A_DEDROP"]
 LABEL_NAMES = ["blur", "rain", "snow", "haze", "drop"]
 ACTION_TO_LABEL_INDEX = {
     "A_DEBLUR": 0,
@@ -42,9 +39,8 @@ ACTION_TO_LABEL_INDEX = {
     "A_DEHAZE": 3,
     "A_DEDROP": 4,
 }
-ACTIONS_INTERNAL = list(ACTION_TO_LABEL_INDEX.keys())
 
-SNOW_CH = ACTION_TO_LABEL_INDEX["A_DESNOW"]  # 2
+IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 
 
 # ============================================================
@@ -72,178 +68,353 @@ def format_time(sec: float) -> str:
     return f"{m}m{s:02d}s"
 
 
-def _pil_load_mask_as_01(path: str) -> torch.Tensor:
+@torch.no_grad()
+def multilabel_metrics_from_logits(logits: torch.Tensor, targets: torch.Tensor, thr: float = 0.5) -> Dict[str, float]:
     """
-    Load mask as float tensor in [0,1], shape (H,W).
-    Supports common mask formats (0/255, etc.).
+    logits: (B,5)
+    targets: (B,5) in {0,1}
     """
-    im = Image.open(path).convert("L")
-    arr = np.array(im).astype(np.float32)
-    # normalize heuristics
-    if arr.max() > 1.5:
+    probs = torch.sigmoid(logits)
+    preds = (probs >= thr).float()
+
+    correct = (preds == targets).float()  # (B,5)
+    acc_per_label = correct.mean(dim=0)   # (5,)
+    acc_macro = acc_per_label.mean().item()
+    exact = (correct.min(dim=1).values).mean().item()
+
+    out = {"acc_macro": float(acc_macro), "exact_match": float(exact)}
+    for i, name in enumerate(LABEL_NAMES):
+        out[f"acc_{name}"] = float(acc_per_label[i].item())
+    return out
+
+
+def pil_to_tensor_rgb(img: Image.Image) -> torch.Tensor:
+    arr = np.array(img).astype(np.float32) / 255.0  # HWC
+    x = torch.from_numpy(arr).permute(2, 0, 1).contiguous()  # CHW
+    return x
+
+
+def pil_to_tensor_mask(img: Image.Image) -> torch.Tensor:
+    # grayscale -> (1,H,W), normalized to [0,1]
+    arr = np.array(img).astype(np.float32)
+    if arr.max() > 1.0:
         arr = arr / 255.0
-    arr = np.clip(arr, 0.0, 1.0)
-    return torch.from_numpy(arr)  # (H,W)
+    x = torch.from_numpy(arr).unsqueeze(0).contiguous()
+    return x
+
+
+def _random_crop_params(H: int, W: int, patch: int, rng: random.Random):
+    if H == patch and W == patch:
+        return 0, 0
+    y0 = rng.randint(0, max(0, H - patch))
+    x0 = rng.randint(0, max(0, W - patch))
+    return y0, x0
+
+
+def _center_crop_params(H: int, W: int, patch: int):
+    y0 = max(0, (H - patch) // 2)
+    x0 = max(0, (W - patch) // 2)
+    return y0, x0
+
+
+def apply_crop_flip_rot(
+    img: Image.Image,
+    patch: int,
+    augment: bool,
+    rng: random.Random,
+    crop_mode: str = "random",
+    same_transform: Optional[Dict[str, Any]] = None,
+) -> Tuple[Image.Image, Dict[str, Any]]:
+    """
+    Apply crop + (optional) flip/rot. If same_transform is provided, reuse it.
+    Returns transformed image and the used transform dict.
+    """
+    img = img.convert("RGB") if img.mode != "RGB" else img
+    W, H = img.size
+
+    # resize up if too small
+    if H < patch or W < patch:
+        img = img.resize((patch, patch), resample=Image.BILINEAR)
+        W, H = img.size
+
+    if same_transform is None:
+        if crop_mode == "center" or (not augment):
+            y0, x0 = _center_crop_params(H, W, patch)
+        else:
+            y0, x0 = _random_crop_params(H, W, patch, rng)
+
+        do_hflip = augment and (rng.random() < 0.5)
+        do_vflip = augment and (rng.random() < 0.2)
+        rot_k = rng.randint(0, 3) if augment else 0  # 0,1,2,3 * 90deg
+
+        tfm = {"y0": y0, "x0": x0, "do_hflip": do_hflip, "do_vflip": do_vflip, "rot_k": rot_k}
+    else:
+        tfm = same_transform
+        y0, x0 = int(tfm["y0"]), int(tfm["x0"])
+        do_hflip = bool(tfm["do_hflip"])
+        do_vflip = bool(tfm["do_vflip"])
+        rot_k = int(tfm["rot_k"])
+
+    img = img.crop((x0, y0, x0 + patch, y0 + patch))
+
+    if do_hflip:
+        img = img.transpose(Image.FLIP_LEFT_RIGHT)
+    if do_vflip:
+        img = img.transpose(Image.FLIP_TOP_BOTTOM)
+    if rot_k > 0:
+        img = img.rotate(90 * rot_k, expand=False)
+
+    return img, tfm
+
+
+def apply_crop_flip_rot_mask(
+    img: Image.Image,
+    patch: int,
+    tfm: Dict[str, Any],
+) -> Image.Image:
+    """
+    Apply SAME transform used for RGB image to mask image.
+    """
+    W, H = img.size
+
+    if H < patch or W < patch:
+        img = img.resize((patch, patch), resample=Image.NEAREST)
+        W, H = img.size
+
+    y0, x0 = int(tfm["y0"]), int(tfm["x0"])
+    do_hflip = bool(tfm["do_hflip"])
+    do_vflip = bool(tfm["do_vflip"])
+    rot_k = int(tfm["rot_k"])
+
+    img = img.crop((x0, y0, x0 + patch, y0 + patch))
+
+    if do_hflip:
+        img = img.transpose(Image.FLIP_LEFT_RIGHT)
+    if do_vflip:
+        img = img.transpose(Image.FLIP_TOP_BOTTOM)
+    if rot_k > 0:
+        img = img.rotate(90 * rot_k, expand=False)
+
+    return img
 
 
 def infer_csd_mask_path(inp_path: str) -> Optional[str]:
     """
-    Robustly infer CSD mask path from an input path.
-    CSD structure you mentioned: .../CSD/{Train|Test}/{Snow,Mask,Gt}/xxx.tif
+    CSD structure:
+      .../CSD/Train/Snow/xxx.tif
+      .../CSD/Train/Mask/xxx.tif
+      .../CSD/Test/Snow/xxx.tif
+      .../CSD/Test/Mask/xxx.tif
+    We replace "\Snow\" with "\Mask\" (case-insensitive).
     """
     p = inp_path.replace("\\", "/")
-    if "/CSD/" not in p:
+    lower = p.lower()
+    if "/csd/" not in lower:
         return None
-    if "/Snow/" not in p and "/snow/" not in p:
+    # find "/snow/" segment
+    if "/snow/" not in lower:
         return None
 
-    # replace /Snow/ with /Mask/
-    p2 = p.replace("/Snow/", "/Mask/").replace("/snow/", "/Mask/")
-    # try same filename
-    cand = p2
-    if os.path.exists(cand):
-        return cand
+    # replace only the last occurrence robustly
+    parts = p.split("/")
+    # find 'Snow' component index
+    idx = None
+    for i in range(len(parts)):
+        if parts[i].lower() == "snow":
+            idx = i
+    if idx is None:
+        return None
+    parts[idx] = "Mask"
+    mask_path = "/".join(parts)
 
-    # sometimes extension differs, try common ones
-    base, ext = os.path.splitext(cand)
-    for e in [".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"]:
-        c = base + e
-        if os.path.exists(c):
-            return c
+    # try same extension
+    if os.path.exists(mask_path):
+        return mask_path
+
+    # fallback: try png/tif variants if extension differs
+    base, ext = os.path.splitext(mask_path)
+    for e in [".png", ".tif", ".tiff", ".jpg", ".jpeg", ".bmp"]:
+        cand = base + e
+        if os.path.exists(cand):
+            return cand
     return None
 
 
 # ============================================================
-# Dataset: mixed action dataset, returns (inp, gt, label5, mask_or_none, meta)
+# Split helper (supports val from train)
+# ============================================================
+def split_train_val_per_action(
+    pairs: List[Tuple[str, str, Dict[str, Any]]],
+    val_ratio: float,
+    seed: int,
+) -> Tuple[List[Tuple[str, str, Dict[str, Any]]], List[Tuple[str, str, Dict[str, Any]]]]:
+    """
+    Deterministic split per action (so each class has val samples).
+    """
+    rng = random.Random(seed)
+    by_action: Dict[str, List[Tuple[str, str, Dict[str, Any]]]] = {a: [] for a in ACTIONS_INTERNAL}
+    for it in pairs:
+        meta = it[2]
+        a = meta.get("action_internal", None)
+        if a in by_action:
+            by_action[a].append(it)
+
+    tr_all, va_all = [], []
+    for a, items in by_action.items():
+        rng.shuffle(items)
+        n = len(items)
+        nv = int(round(n * val_ratio))
+        nv = max(1, nv) if n > 1 else 0
+        va = items[:nv]
+        tr = items[nv:]
+        tr_all.extend(tr)
+        va_all.extend(va)
+
+    rng.shuffle(tr_all)
+    rng.shuffle(va_all)
+    return tr_all, va_all
+
+
+# ============================================================
+# Dataset (NO LoRAPairedDataset usage)
 # ============================================================
 class DiagnoserMapDataset(Dataset):
+    """
+    Returns:
+      inp: (3,H,W) float
+      gt : (3,H,W) float  (not strictly required, but kept)
+      y  : (5,) one-hot global label
+      mask_map: (5,H,W) float target map (only snow uses CSD mask; else zeros)
+      mask_valid: (1,) 1 if map supervision is valid else 0
+      meta: dict
+    """
+
     def __init__(
         self,
         data_root: str,
         split: str,
         patch: int,
         augment: bool,
-        max_per_action: int = -1,
-        seed: int = 123,
-        strict_size_check: bool = False,
-        use_csd_mask: bool = True,
+        max_per_action: int,
+        seed: int,
+        use_csd_mask: bool,
+        val_from_train: bool = False,
+        val_ratio: float = 0.2,
     ):
         super().__init__()
         self.data_root = data_root
         self.split = split
-        self.patch = patch
-        self.augment = augment
+        self.patch = int(patch)
+        self.augment = bool(augment)
         self.max_per_action = int(max_per_action)
         self.seed = int(seed)
-        self.strict_size_check = strict_size_check
         self.use_csd_mask = bool(use_csd_mask)
 
         rng = random.Random(self.seed)
+
+        # collect per action from build_action_pairs(train|test only)
+        # If split == "val", we will build from train then split.
+        build_split = split
+        if split == "val":
+            build_split = "train"
 
         all_pairs: List[Tuple[str, str, Dict[str, Any]]] = []
         self.stats_by_action: Dict[str, int] = {}
 
         for action in ACTIONS_INTERNAL:
-            pair_cfg = ActionPairConfig(action=action, split=split, data_root=data_root)
-            pairs, reports = build_action_pairs(pair_cfg)
+            pair_cfg = ActionPairConfig(action=action, split=build_split, data_root=data_root)
+            pairs, _ = build_action_pairs(pair_cfg)
 
-            if self.max_per_action > 0 and len(pairs) > self.max_per_action:
-                pairs = pairs.copy()
-                rng.shuffle(pairs)
-                pairs = pairs[: self.max_per_action]
-
-            new_pairs = []
+            # attach action into meta (ensure dict)
+            fixed = []
             for inp_path, gt_path, meta in pairs:
-                meta2 = dict(meta)
-                meta2["action_internal"] = action
-                meta2["inp_path"] = inp_path
-                meta2["gt_path"] = gt_path
-                # keep dataset name if exists
-                # meta2["dataset"] expected in your codebase
-                new_pairs.append((inp_path, gt_path, meta2))
+                if not isinstance(meta, dict):
+                    # hard guard (shouldn't happen with build_action_pairs)
+                    meta = {"dataset": "UNKNOWN"}
+                m2 = dict(meta)
+                m2["action_internal"] = action
+                fixed.append((inp_path, gt_path, m2))
 
-            all_pairs.extend(new_pairs)
-            self.stats_by_action[action] = len(new_pairs)
+            # cap per action (balance)
+            if self.max_per_action > 0 and len(fixed) > self.max_per_action:
+                rng.shuffle(fixed)
+                fixed = fixed[: self.max_per_action]
+
+            all_pairs.extend(fixed)
+            self.stats_by_action[action] = len(fixed)
 
         rng.shuffle(all_pairs)
 
-        # reuse your paired dataset loader for cropping/augment
-        self.base = LoRAPairedDataset(
-            pairs=all_pairs,
-            patch=self.patch,
-            augment=self.augment,
-            strict_size_check=self.strict_size_check,
-        )
+        # If val split requested, do deterministic split per action
+        if split == "val":
+            tr, va = split_train_val_per_action(all_pairs, val_ratio=val_ratio, seed=self.seed)
+            self.pairs = va
+        elif val_from_train and split == "train":
+            tr, va = split_train_val_per_action(all_pairs, val_ratio=val_ratio, seed=self.seed)
+            self.pairs = tr
+        else:
+            self.pairs = all_pairs
 
-    def __len__(self) -> int:
-        return len(self.base)
+        self.rng = random.Random(self.seed + (0 if split == "train" else 999))
+
+    def __len__(self):
+        return len(self.pairs)
 
     def __getitem__(self, idx: int):
-        inp, gt, meta = self.base[idx]
-        action = meta.get("action_internal")
-        if action is None:
-            raise RuntimeError("meta must contain 'action_internal'")
+        inp_path, gt_path, meta = self.pairs[idx]
+        assert isinstance(meta, dict), "meta must be dict"
+
+        # load images
+        inp_img = Image.open(inp_path).convert("RGB")
+        gt_img = Image.open(gt_path).convert("RGB")
+
+        # crop/augment with SAME transform for inp and gt
+        crop_mode = "random" if self.augment else "center"
+        inp_img, tfm = apply_crop_flip_rot(inp_img, self.patch, self.augment, self.rng, crop_mode=crop_mode)
+        gt_img, _ = apply_crop_flip_rot(gt_img, self.patch, self.augment, self.rng, crop_mode=crop_mode, same_transform=tfm)
+
+        inp = pil_to_tensor_rgb(inp_img)  # (3,H,W)
+        gt = pil_to_tensor_rgb(gt_img)
 
         # global one-hot label
+        action = meta.get("action_internal")
         y = torch.zeros(5, dtype=torch.float32)
         y[ACTION_TO_LABEL_INDEX[action]] = 1.0
 
-        # optional CSD snow mask (only meaningful for A_DESNOW)
-        mask = None
+        # map target
+        map_t = torch.zeros(5, self.patch, self.patch, dtype=torch.float32)
+        mask_valid = torch.zeros(1, dtype=torch.float32)
+
         if self.use_csd_mask and action == "A_DESNOW":
-            inp_path = meta.get("inp_path", None)
-            # try meta hints first
-            mpath = meta.get("mask_path", None) or meta.get("mask", None)
-            if mpath is None and isinstance(inp_path, str):
-                mpath = infer_csd_mask_path(inp_path)
-            if mpath is not None and os.path.exists(mpath):
-                mask_hw = _pil_load_mask_as_01(mpath)  # (H,W) original
-                # IMPORTANT: base dataset likely returns cropped patches; we need mask aligned to crop
-                # If LoRAPairedDataset stores crop info in meta (x0,y0,...), use it; otherwise fallback to center-crop.
-                x0 = meta.get("crop_x", None)
-                y0 = meta.get("crop_y", None)
-                ph = inp.shape[1]  # H
-                pw = inp.shape[2]  # W
-                if x0 is not None and y0 is not None:
-                    x0 = int(x0); y0 = int(y0)
-                    mask_hw = mask_hw[y0:y0+ph, x0:x0+pw]
-                else:
-                    # fallback: center crop (best-effort)
-                    Hm, Wm = mask_hw.shape
-                    cy = max(0, (Hm - ph) // 2)
-                    cx = max(0, (Wm - pw) // 2)
-                    mask_hw = mask_hw[cy:cy+ph, cx:cx+pw]
+            # try infer CSD mask path from inp_path
+            mp = infer_csd_mask_path(inp_path)
+            if mp is not None and os.path.exists(mp):
+                m_img = Image.open(mp).convert("L")
+                m_img = apply_crop_flip_rot_mask(m_img, self.patch, tfm)
+                m = pil_to_tensor_mask(m_img).clamp(0, 1)  # (1,H,W)
+                map_t[2:3] = m  # snow channel index = 2
+                mask_valid[0] = 1.0
+            else:
+                # CSD mask missing => no map supervision
+                mask_valid[0] = 0.0
 
-                # ensure size matches inp patch
-                if mask_hw.shape[0] != ph or mask_hw.shape[1] != pw:
-                    # resize to patch size
-                    mask_hw = torch.from_numpy(
-                        np.array(Image.fromarray((mask_hw.numpy()*255).astype(np.uint8)).resize((pw, ph), resample=Image.NEAREST)).astype(np.float32) / 255.0
-                    )
-
-                mask = mask_hw.unsqueeze(0)  # (1,H,W) snow mask only
-
-        return inp, gt, y, mask, meta
+        return inp, gt, y, map_t, mask_valid, meta
 
 
 def collate_diagnoser_map(batch):
-    inps = torch.stack([b[0] for b in batch], dim=0)   # (B,3,H,W)
-    gts  = torch.stack([b[1] for b in batch], dim=0)   # (B,3,H,W)
-    ys   = torch.stack([b[2] for b in batch], dim=0)   # (B,5)
-    masks = [b[3] for b in batch]                      # list of None or (1,H,W)
-    metas = [b[4] for b in batch]
-    return inps, gts, ys, masks, metas
+    inp = torch.stack([b[0] for b in batch], dim=0)          # (B,3,H,W)
+    gt = torch.stack([b[1] for b in batch], dim=0)           # (B,3,H,W)
+    y = torch.stack([b[2] for b in batch], dim=0)            # (B,5)
+    maps = torch.stack([b[3] for b in batch], dim=0)         # (B,5,H,W)
+    valid = torch.stack([b[4] for b in batch], dim=0)         # (B,1)
+    metas = [b[5] for b in batch]
+    return inp, gt, y, maps, valid, metas
 
 
 # ============================================================
-# Model: ViT-like encoder that outputs both s (global) and m (map)
+# Model: TinyViT with Global head + Map head
 # ============================================================
-class TinyViTDiagnoserWithMap(nn.Module):
-    """
-    Outputs:
-      s_logits: (B,5)
-      m_logits: (B,5,gh,gw)  where gh=H/patch, gw=W/patch (token grid)
-    """
+class TinyViTDiagnoserMap(nn.Module):
     def __init__(
         self,
         img_size: int = 256,
@@ -260,10 +431,8 @@ class TinyViTDiagnoserWithMap(nn.Module):
         assert img_size % patch_size == 0
         self.img_size = img_size
         self.patch_size = patch_size
-        self.gh = img_size // patch_size
-        self.gw = img_size // patch_size
-        self.num_patches = self.gh * self.gw
-        self.embed_dim = embed_dim
+        self.grid = img_size // patch_size
+        self.num_patches = self.grid * self.grid
 
         self.patch_embed = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size, bias=True)
 
@@ -281,14 +450,16 @@ class TinyViTDiagnoserWithMap(nn.Module):
             norm_first=True,
         )
         self.encoder = nn.TransformerEncoder(enc_layer, num_layers=depth)
+
         self.norm = nn.LayerNorm(embed_dim)
 
-        # global head (CLS)
+        # global head
         self.head_global = nn.Linear(embed_dim, num_labels)
 
-        # map head (tokens -> per-patch logits)
-        self.head_map = nn.Linear(embed_dim, num_labels)
+        # map head: token grid -> 5ch map at patch resolution
+        self.head_map = nn.Conv2d(embed_dim, num_labels, kernel_size=1, stride=1, padding=0, bias=True)
 
+        # init
         nn.init.trunc_normal_(self.cls_token, std=0.02)
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
         nn.init.trunc_normal_(self.head_global.weight, std=0.02)
@@ -297,72 +468,59 @@ class TinyViTDiagnoserWithMap(nn.Module):
         nn.init.zeros_(self.head_map.bias)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        returns:
+          logits_global: (B,5)
+          logits_map: (B,5,H,W)  (upsampled to img_size)
+        """
         B, C, H, W = x.shape
-        # patchify
-        t = self.patch_embed(x)                # (B, D, gh, gw)
-        t = t.flatten(2).transpose(1, 2)       # (B, N, D) N=gh*gw
+        assert H == self.img_size and W == self.img_size, "input must be cropped to img_size"
 
-        cls = self.cls_token.expand(B, -1, -1) # (B,1,D)
-        z = torch.cat([cls, t], dim=1)         # (B,1+N,D)
+        # patch embed
+        t = self.patch_embed(x)                           # (B,D,g,g)
+        t_flat = t.flatten(2).transpose(1, 2)            # (B,N,D)
+
+        cls = self.cls_token.expand(B, -1, -1)           # (B,1,D)
+        z = torch.cat([cls, t_flat], dim=1)              # (B,1+N,D)
         z = z + self.pos_embed[:, : z.size(1)]
         z = self.pos_drop(z)
 
-        z = self.encoder(z)                    # (B,1+N,D)
-        z = self.norm(z)
+        z = self.encoder(z)                              # (B,1+N,D)
 
         # global
-        cls_tok = z[:, 0]                      # (B,D)
-        s_logits = self.head_global(cls_tok)   # (B,5)
+        g = self.norm(z[:, 0])                           # (B,D)
+        logits_global = self.head_global(g)              # (B,5)
 
-        # map (tokens only)
-        tok = z[:, 1:]                         # (B,N,D)
-        m_logits_flat = self.head_map(tok)     # (B,N,5)
-        m_logits = m_logits_flat.transpose(1, 2).contiguous().view(B, 5, self.gh, self.gw)  # (B,5,gh,gw)
+        # map tokens (exclude cls)
+        tokens = z[:, 1:]                                # (B,N,D)
+        tokens = tokens.transpose(1, 2).contiguous()     # (B,D,N)
+        tokens = tokens.view(B, -1, self.grid, self.grid)  # (B,D,g,g)
 
-        return s_logits, m_logits
+        logits_low = self.head_map(tokens)               # (B,5,g,g)
+        logits_map = F.interpolate(logits_low, size=(self.img_size, self.img_size), mode="bilinear", align_corners=False)
 
-
-# ============================================================
-# Metrics
-# ============================================================
-@torch.no_grad()
-def multilabel_metrics_from_logits(logits: torch.Tensor, targets: torch.Tensor, thr: float = 0.5) -> Dict[str, float]:
-    probs = torch.sigmoid(logits)
-    preds = (probs >= thr).float()
-    correct = (preds == targets).float()
-    acc_per = correct.mean(dim=0)
-    acc_macro = acc_per.mean().item()
-    exact = (correct.min(dim=1).values).mean().item()
-    out = {"acc_macro": float(acc_macro), "exact_match": float(exact)}
-    for i, name in enumerate(LABEL_NAMES):
-        out[f"acc_{name}"] = float(acc_per[i].item())
-    return out
+        return logits_global, logits_map
 
 
-# ============================================================
-# CKPT load (Phase-2a init)
-# ============================================================
-def load_phase2a_init(model: nn.Module, init_ckpt: str) -> Dict[str, Any]:
+def load_init_ckpt(model: nn.Module, ckpt_path: str):
     """
-    Loads a Phase-2a ckpt that was saved with keys:
-      - state_dict (best/last)
-    We load with strict=False because Phase-2b has an extra head_map.
+    Supports:
+      - train_diagnoser.py ckpt with keys: head.weight/head.bias
+      - train_diagnoser_map.py ckpt with keys: head_global.*, head_map.*
+    We remap head.* -> head_global.* when needed.
     """
-    ckpt = torch.load(init_ckpt, map_location="cpu")
-    if isinstance(ckpt, dict) and "state_dict" in ckpt:
-        sd = ckpt["state_dict"]
-    elif isinstance(ckpt, dict):
-        sd = ckpt
-    else:
-        sd = ckpt
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    sd = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
+
+    # remap old head -> head_global
+    if "head.weight" in sd and "head_global.weight" not in sd:
+        sd2 = dict(sd)
+        sd2["head_global.weight"] = sd2.pop("head.weight")
+        sd2["head_global.bias"] = sd2.pop("head.bias")
+        sd = sd2
+
     missing, unexpected = model.load_state_dict(sd, strict=False)
-    return {
-        "init_ckpt": init_ckpt,
-        "missing": missing[:20],
-        "unexpected": unexpected[:20],
-        "missing_n": len(missing),
-        "unexpected_n": len(unexpected),
-    }
+    return missing, unexpected
 
 
 # ============================================================
@@ -395,11 +553,14 @@ class TrainCfg:
 
     max_per_action: int
     seed: int
-
     thr: float
+
     lambda_map: float
     map_warmup_epochs: int
     use_csd_mask: bool
+
+    val_from_train: bool
+    val_ratio: float
 
 
 def parse_args() -> TrainCfg:
@@ -407,11 +568,10 @@ def parse_args() -> TrainCfg:
 
     ap.add_argument("--data_root", default="E:/ReAct-IR/data")
     ap.add_argument("--out_dir", default="E:/ReAct-IR/checkpoints/diagnoser")
-
-    ap.add_argument("--init_ckpt", required=True, help="Phase-2a diagnoser_best.pth path")
+    ap.add_argument("--init_ckpt", default="E:/ReAct-IR/checkpoints/diagnoser/diagnoser_best.pth")
 
     ap.add_argument("--split_train", default="train")
-    ap.add_argument("--split_val", default="val")
+    ap.add_argument("--split_val", default="test", help="train|test|val (val uses train split internally)")
 
     ap.add_argument("--patch", type=int, default=256)
     ap.add_argument("--batch_size", type=int, default=16)
@@ -430,13 +590,16 @@ def parse_args() -> TrainCfg:
     ap.add_argument("--vit_depth", type=int, default=6)
     ap.add_argument("--vit_heads", type=int, default=6)
 
-    ap.add_argument("--max_per_action", type=int, default=-1)
+    ap.add_argument("--max_per_action", type=int, default=2000)
     ap.add_argument("--seed", type=int, default=123)
-
     ap.add_argument("--thr", type=float, default=0.5)
+
     ap.add_argument("--lambda_map", type=float, default=1.0)
-    ap.add_argument("--map_warmup_epochs", type=int, default=1, help="epochs to train cls only before adding map loss")
+    ap.add_argument("--map_warmup_epochs", type=int, default=1)
     ap.add_argument("--use_csd_mask", type=int, default=1)
+
+    ap.add_argument("--val_from_train", type=int, default=0, help="if 1, train split also removes val_ratio from train per-action")
+    ap.add_argument("--val_ratio", type=float, default=0.2)
 
     a = ap.parse_args()
     return TrainCfg(
@@ -464,12 +627,20 @@ def parse_args() -> TrainCfg:
         lambda_map=float(a.lambda_map),
         map_warmup_epochs=int(a.map_warmup_epochs),
         use_csd_mask=bool(int(a.use_csd_mask)),
+        val_from_train=bool(int(a.val_from_train)),
+        val_ratio=float(a.val_ratio),
     )
 
 
 # ============================================================
-# Train/Eval
+# Train / Eval
 # ============================================================
+def map_loss_weight(epoch: int, warmup_epochs: int) -> float:
+    if warmup_epochs <= 0:
+        return 1.0
+    return min(1.0, float(epoch) / float(warmup_epochs))
+
+
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -479,65 +650,59 @@ def train_one_epoch(
     use_amp: bool,
     thr: float,
     lambda_map: float,
-    use_map_loss: bool,
+    map_w: float,
 ) -> Dict[str, float]:
     model.train()
     bce = nn.BCEWithLogitsLoss()
+    bce_map = nn.BCEWithLogitsLoss(reduction="none")
 
     loss_sum = 0.0
-    loss_cls_sum = 0.0
-    loss_map_sum = 0.0
+    loss_g_sum = 0.0
+    loss_m_sum = 0.0
     n = 0
 
     t0 = time.time()
     pbar = tqdm(loader, ncols=140, desc="Train")
 
-    for it, (inp, gt, y, masks, metas) in enumerate(pbar, start=1):
+    last_metrics = {}
+
+    for it, (inp, gt, y, maps, valid, metas) in enumerate(pbar, start=1):
         inp = inp.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
+        maps = maps.to(device, non_blocking=True)
+        valid = valid.to(device, non_blocking=True)  # (B,1)
 
         opt.zero_grad(set_to_none=True)
 
         with autocast(device_type="cuda", dtype=torch.float16, enabled=(use_amp and device.type == "cuda")):
-            s_logits, m_logits = model(inp)
+            logits_g, logits_m = model(inp)  # (B,5), (B,5,H,W)
 
-            loss_cls = bce(s_logits, y)
+            loss_g = bce(logits_g, y)
 
-            loss_map = torch.zeros((), device=device)
-            if use_map_loss:
-                # only supervise snow map when mask exists
-                # m_logits: (B,5,gh,gw) -> upsample to (B,5,H,W)
-                m_up = F.interpolate(m_logits, size=(inp.shape[2], inp.shape[3]), mode="bilinear", align_corners=False)
+            # map loss only where valid==1 (CSD snow samples)
+            # compute per-pixel BCE and average
+            per = bce_map(logits_m, maps)  # (B,5,H,W)
+            # apply sample validity
+            v = valid.view(-1, 1, 1, 1)    # (B,1,1,1)
+            per = per * v
+            denom = v.sum() * per.shape[1] * per.shape[2] * per.shape[3]
+            loss_m = per.sum() / (denom + 1e-6)
 
-                # build mask batch tensor for snow channel only
-                # masks list items: None or (1,H,W)
-                snow_masks = []
-                snow_idx = []
-                for bi, mk in enumerate(masks):
-                    if mk is not None:
-                        snow_masks.append(mk)   # (1,H,W)
-                        snow_idx.append(bi)
-                if len(snow_masks) > 0:
-                    snow_masks = torch.stack(snow_masks, dim=0).to(device, non_blocking=True)  # (B2,1,H,W)
-                    # pick corresponding predictions
-                    pred_snow = m_up[snow_idx, SNOW_CH:SNOW_CH+1, :, :]  # (B2,1,H,W)
-                    # BCE on map logits
-                    loss_map = F.binary_cross_entropy_with_logits(pred_snow, snow_masks)
-
-            loss = loss_cls + (lambda_map * loss_map)
+            loss = loss_g + (lambda_map * map_w) * loss_m
 
         scaler.scale(loss).backward()
         scaler.step(opt)
         scaler.update()
 
-        bs = int(inp.size(0))
-        loss_sum += float(loss.item()) * bs
-        loss_cls_sum += float(loss_cls.item()) * bs
-        loss_map_sum += float(loss_map.item()) * bs
-        n += bs
+        B = inp.size(0)
+        loss_sum += float(loss.item()) * B
+        loss_g_sum += float(loss_g.item()) * B
+        loss_m_sum += float(loss_m.item()) * B
+        n += B
 
         with torch.no_grad():
-            m = multilabel_metrics_from_logits(s_logits.detach(), y, thr=thr)
+            m = multilabel_metrics_from_logits(logits_g.detach(), y, thr=thr)
+            last_metrics = m
 
         elapsed = time.time() - t0
         it_per_sec = it / max(elapsed, 1e-6)
@@ -545,18 +710,20 @@ def train_one_epoch(
 
         pbar.set_postfix({
             "L": f"{loss_sum/max(n,1):.4f}",
-            "Lcls": f"{loss_cls_sum/max(n,1):.4f}",
-            "Lmap": f"{loss_map_sum/max(n,1):.4f}" if use_map_loss else "0.0000",
+            "Lg": f"{loss_g_sum/max(n,1):.4f}",
+            "Lm": f"{loss_m_sum/max(n,1):.4f}",
+            "mw": f"{map_w:.2f}",
             "acc": f"{m['acc_macro']:.3f}",
+            "ex": f"{m['exact_match']:.3f}",
             "ETA": format_time(eta_sec),
         })
 
     out = {
         "loss": float(loss_sum / max(n, 1)),
-        "loss_cls": float(loss_cls_sum / max(n, 1)),
-        "loss_map": float(loss_map_sum / max(n, 1)),
+        "loss_global": float(loss_g_sum / max(n, 1)),
+        "loss_map": float(loss_m_sum / max(n, 1)),
     }
-    out.update({k: float(v) for k, v in m.items()})
+    out.update({k: float(v) for k, v in last_metrics.items()})
     return out
 
 
@@ -568,69 +735,74 @@ def eval_one_epoch(
     use_amp: bool,
     thr: float,
     lambda_map: float,
-    use_map_loss: bool,
+    map_w: float,
 ) -> Dict[str, float]:
     model.eval()
     bce = nn.BCEWithLogitsLoss()
+    bce_map = nn.BCEWithLogitsLoss(reduction="none")
 
     loss_sum = 0.0
-    loss_cls_sum = 0.0
-    loss_map_sum = 0.0
+    loss_g_sum = 0.0
+    loss_m_sum = 0.0
     n = 0
 
-    m_accum = None
+    m_accum = None  # type: Optional[Dict[str, float]]
 
     pbar = tqdm(loader, ncols=140, desc="Val ")
-    for inp, gt, y, masks, metas in pbar:
+    for inp, gt, y, maps, valid, metas in pbar:
         inp = inp.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
+        maps = maps.to(device, non_blocking=True)
+        valid = valid.to(device, non_blocking=True)
 
         with autocast(device_type="cuda", dtype=torch.float16, enabled=(use_amp and device.type == "cuda")):
-            s_logits, m_logits = model(inp)
-            loss_cls = bce(s_logits, y)
+            logits_g, logits_m = model(inp)
 
-            loss_map = torch.zeros((), device=device)
-            if use_map_loss:
-                m_up = F.interpolate(m_logits, size=(inp.shape[2], inp.shape[3]), mode="bilinear", align_corners=False)
-                snow_masks = []
-                snow_idx = []
-                for bi, mk in enumerate(masks):
-                    if mk is not None:
-                        snow_masks.append(mk)
-                        snow_idx.append(bi)
-                if len(snow_masks) > 0:
-                    snow_masks = torch.stack(snow_masks, dim=0).to(device, non_blocking=True)
-                    pred_snow = m_up[snow_idx, SNOW_CH:SNOW_CH+1, :, :]
-                    loss_map = F.binary_cross_entropy_with_logits(pred_snow, snow_masks)
+            loss_g = bce(logits_g, y)
 
-            loss = loss_cls + (lambda_map * loss_map)
+            per = bce_map(logits_m, maps)
+            v = valid.view(-1, 1, 1, 1)
+            per = per * v
+            denom = v.sum() * per.shape[1] * per.shape[2] * per.shape[3]
+            loss_m = per.sum() / (denom + 1e-6)
 
-        bs = int(inp.size(0))
-        loss_sum += float(loss.item()) * bs
-        loss_cls_sum += float(loss_cls.item()) * bs
-        loss_map_sum += float(loss_map.item()) * bs
-        n += bs
+            loss = loss_g + (lambda_map * map_w) * loss_m
 
-        m = multilabel_metrics_from_logits(s_logits, y, thr=thr)
-        m_accum = m if m_accum is None else {k: (m_accum[k] + m[k]) for k in m_accum.keys()}
+        B = inp.size(0)
+        loss_sum += float(loss.item()) * B
+        loss_g_sum += float(loss_g.item()) * B
+        loss_m_sum += float(loss_m.item()) * B
+        n += B
+
+        m = multilabel_metrics_from_logits(logits_g, y, thr=thr)
+        if m_accum is None:
+            m_accum = {k: float(v) for k, v in m.items()}
+        else:
+            for k in m_accum.keys():
+                m_accum[k] += float(m[k])
 
         pbar.set_postfix({
             "L": f"{loss_sum/max(n,1):.4f}",
-            "Lcls": f"{loss_cls_sum/max(n,1):.4f}",
-            "Lmap": f"{loss_map_sum/max(n,1):.4f}" if use_map_loss else "0.0000",
+            "Lg": f"{loss_g_sum/max(n,1):.4f}",
+            "Lm": f"{loss_m_sum/max(n,1):.4f}",
             "acc": f"{m['acc_macro']:.3f}",
+            "ex": f"{m['exact_match']:.3f}",
         })
 
     out = {
         "loss": float(loss_sum / max(n, 1)),
-        "loss_cls": float(loss_cls_sum / max(n, 1)),
-        "loss_map": float(loss_map_sum / max(n, 1)),
+        "loss_global": float(loss_g_sum / max(n, 1)),
+        "loss_map": float(loss_m_sum / max(n, 1)),
     }
     if m_accum is not None:
-        out.update({k: float(v / max(len(loader), 1)) for k, v in m_accum.items()})
+        for k in m_accum.keys():
+            out[k] = float(m_accum[k] / max(len(loader), 1))
     return out
 
 
+# ============================================================
+# Main
+# ============================================================
 def main():
     cfg = parse_args()
     seed_all(cfg.seed)
@@ -650,7 +822,8 @@ def main():
 
     safe_makedirs(cfg.out_dir)
 
-    # ---------------- datasets ----------------
+    # ---- dataset
+    # split_val supports val (internal split from train)
     ds_tr = DiagnoserMapDataset(
         data_root=cfg.data_root,
         split=cfg.split_train,
@@ -658,21 +831,39 @@ def main():
         augment=True,
         max_per_action=cfg.max_per_action,
         seed=cfg.seed,
-        strict_size_check=False,
         use_csd_mask=cfg.use_csd_mask,
+        val_from_train=cfg.val_from_train,
+        val_ratio=cfg.val_ratio,
     )
-    ds_va = DiagnoserMapDataset(
-        data_root=cfg.data_root,
-        split=cfg.split_val,
-        patch=cfg.patch,
-        augment=False,
-        max_per_action=cfg.max_per_action if cfg.max_per_action > 0 else -1,
-        seed=cfg.seed + 1,
-        strict_size_check=False,
-        use_csd_mask=cfg.use_csd_mask,
-    )
+
+    if cfg.split_val == "val":
+        ds_va = DiagnoserMapDataset(
+            data_root=cfg.data_root,
+            split="val",
+            patch=cfg.patch,
+            augment=False,
+            max_per_action=cfg.max_per_action,
+            seed=cfg.seed + 1,
+            use_csd_mask=cfg.use_csd_mask,
+            val_from_train=False,
+            val_ratio=cfg.val_ratio,
+        )
+    else:
+        ds_va = DiagnoserMapDataset(
+            data_root=cfg.data_root,
+            split=cfg.split_val,
+            patch=cfg.patch,
+            augment=False,
+            max_per_action=cfg.max_per_action,
+            seed=cfg.seed + 1,
+            use_csd_mask=cfg.use_csd_mask,
+            val_from_train=False,
+            val_ratio=cfg.val_ratio,
+        )
+
     print("[Train] total:", len(ds_tr), "by_action:", ds_tr.stats_by_action)
     print("[Val  ] total:", len(ds_va), "by_action:", ds_va.stats_by_action)
+    print("[Map] use_csd_mask =", cfg.use_csd_mask)
 
     loader_tr = DataLoader(
         ds_tr,
@@ -695,8 +886,8 @@ def main():
         persistent_workers=(cfg.num_workers > 0),
     )
 
-    # ---------------- model ----------------
-    model = TinyViTDiagnoserWithMap(
+    # ---- model
+    model = TinyViTDiagnoserMap(
         img_size=cfg.patch,
         patch_size=cfg.vit_patch,
         embed_dim=cfg.vit_dim,
@@ -704,18 +895,24 @@ def main():
         num_heads=cfg.vit_heads,
         num_labels=len(LABEL_NAMES),
     )
-    init_info = load_phase2a_init(model, cfg.init_ckpt)
-    print("[Init] loaded with strict=False")
-    print(f"  missing={init_info['missing_n']} unexpected={init_info['unexpected_n']}")
-    if init_info["missing_n"] > 0:
-        print("  example missing:", init_info["missing"][:10])
-    if init_info["unexpected_n"] > 0:
-        print("  example unexpected:", init_info["unexpected"][:10])
 
     model.to(device)
     if cfg.channels_last and device.type == "cuda":
         model = model.to(memory_format=torch.channels_last)
 
+    # ---- init ckpt
+    if cfg.init_ckpt and os.path.exists(cfg.init_ckpt):
+        missing, unexpected = load_init_ckpt(model, cfg.init_ckpt)
+        print("[Init] loaded with strict=False")
+        print(f"  missing={len(missing)} unexpected={len(unexpected)}")
+        if len(missing) > 0:
+            print("  example missing:", missing[:10])
+        if len(unexpected) > 0:
+            print("  example unexpected:", unexpected[:10])
+    else:
+        print("[Init] skipped (ckpt not found)")
+
+    # ---- opt
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scaler = GradScaler(enabled=(cfg.use_amp and device.type == "cuda"))
 
@@ -726,31 +923,29 @@ def main():
     print("\n[Train] start")
     for epoch in range(1, cfg.epochs + 1):
         t0 = time.time()
-        use_map_loss = (epoch > cfg.map_warmup_epochs)
+        mw = map_loss_weight(epoch, cfg.map_warmup_epochs)
 
         tr = train_one_epoch(
             model, loader_tr, opt, scaler, device,
             use_amp=cfg.use_amp, thr=cfg.thr,
-            lambda_map=cfg.lambda_map, use_map_loss=use_map_loss
+            lambda_map=cfg.lambda_map, map_w=mw
         )
         va = eval_one_epoch(
             model, loader_va, device,
             use_amp=cfg.use_amp, thr=cfg.thr,
-            lambda_map=cfg.lambda_map, use_map_loss=use_map_loss
+            lambda_map=cfg.lambda_map, map_w=mw
         )
 
-        print(
-            f"\n[Epoch {epoch:03d}/{cfg.epochs}] "
-            f"train: L={tr['loss']:.4f} (cls={tr['loss_cls']:.4f} map={tr['loss_map']:.4f}) acc={tr['acc_macro']:.3f} | "
-            f"val: L={va['loss']:.4f} (cls={va['loss_cls']:.4f} map={va['loss_map']:.4f}) acc={va.get('acc_macro',0):.3f} | "
-            f"map_on={int(use_map_loss)} time={format_time(time.time()-t0)}"
-        )
+        print(f"\n[Epoch {epoch:03d}/{cfg.epochs}] "
+              f"train: L={tr['loss']:.4f} (Lg={tr['loss_global']:.4f}, Lm={tr['loss_map']:.4f}) acc={tr['acc_macro']:.3f} ex={tr['exact_match']:.3f} | "
+              f"val: L={va['loss']:.4f} (Lg={va['loss_global']:.4f}, Lm={va['loss_map']:.4f}) acc={va.get('acc_macro',0):.3f} ex={va.get('exact_match',0):.3f} | "
+              f"mw={mw:.2f} time={format_time(time.time()-t0)}")
 
         ckpt = {
             "epoch": epoch,
             "cfg": vars(cfg),
             "label_names": LABEL_NAMES,
-            "init_ckpt": cfg.init_ckpt,
+            "actions": ACTIONS_INTERNAL,
             "state_dict": model.state_dict(),
             "train": tr,
             "val": va,
@@ -769,15 +964,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-"""
-python scripts/train_diagnoser_map.py ^
-  --data_root "E:/ReAct-IR/data" ^
-  --out_dir "E:/ReAct-IR/checkpoints/diagnoser" ^
-  --init_ckpt "E:/ReAct-IR/checkpoints/diagnoser/diagnoser_best.pth" ^
-  --split_train train --split_val val ^
-  --epochs 10 --batch_size 16 --num_workers 4 ^
-  --lambda_map 1.0 --map_warmup_epochs 1 ^
-  --use_csd_mask 1
-
-"""
