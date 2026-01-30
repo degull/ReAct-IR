@@ -1,0 +1,35 @@
+{
+  "items": 42,
+  "best_action_acc": 0.9761904761904762,
+  "scale0_vs_base_psnr_abs": {
+    "n": 42,
+    "mean": 12.152248954175427,
+    "p95": 63.273139188630644,
+    "max": 72.17890150505735
+  },
+  "scale0_cross_action_psnr_range": {
+    "n": 42,
+    "mean": 0.0,
+    "p95": 0.0,
+    "max": 0.0
+  },
+  "dpsnr_recompute_abs": {
+    "n": 1050,
+    "mean": 12.152248954175423,
+    "p95": 65.58501353708122,
+    "max": 72.17890150505735
+  },
+  "dssim_recompute_abs": {
+    "n": 1050,
+    "mean": 0.15010454087709438,
+    "p95": 0.599779910889799,
+    "max": 0.6407704816643788
+  },
+  "counts": {
+    "scale0_mismatch_samples": 41,
+    "scale0_cross_action_samples": 0,
+    "dpsnr_bad": 1025,
+    "dssim_bad": 1050,
+    "huge_delta": 11
+  }
+}

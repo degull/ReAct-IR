@@ -1,0 +1,11 @@
+{"dpsnr": 13.14662384844025, "id": 27, "input": "E:/ReAct-IR/data/DayRainDrop/Blur/00210/00009.png", "action": "A_DEBLUR", "scale": 0.5}
+{"dpsnr": 17.2888166992387, "id": 27, "input": "E:/ReAct-IR/data/DayRainDrop/Blur/00210/00009.png", "action": "A_DEBLUR", "scale": 0.75}
+{"dpsnr": 21.616279619179018, "id": 27, "input": "E:/ReAct-IR/data/DayRainDrop/Blur/00210/00009.png", "action": "A_DEBLUR", "scale": 1.0}
+{"dpsnr": 11.768673861725127, "id": 27, "input": "E:/ReAct-IR/data/DayRainDrop/Blur/00210/00009.png", "action": "A_DERAIN", "scale": 1.0}
+{"dpsnr": 10.62401988699731, "id": 31, "input": "E:/ReAct-IR/data/DayRainDrop/Blur/00145/00004.png", "action": "A_DEBLUR", "scale": 0.75}
+{"dpsnr": 12.344384879059234, "id": 31, "input": "E:/ReAct-IR/data/DayRainDrop/Blur/00145/00004.png", "action": "A_DEBLUR", "scale": 1.0}
+{"dpsnr": 11.792635528509344, "id": 32, "input": "E:/ReAct-IR/data/DayRainDrop/Blur/00208/00024.png", "action": "A_DEBLUR", "scale": 0.5}
+{"dpsnr": 15.606790617081536, "id": 32, "input": "E:/ReAct-IR/data/DayRainDrop/Blur/00208/00024.png", "action": "A_DEBLUR", "scale": 0.75}
+{"dpsnr": 21.989701884460246, "id": 32, "input": "E:/ReAct-IR/data/DayRainDrop/Blur/00208/00024.png", "action": "A_DEBLUR", "scale": 1.0}
+{"dpsnr": 10.137472037843771, "id": 32, "input": "E:/ReAct-IR/data/DayRainDrop/Blur/00208/00024.png", "action": "A_DEDROP", "scale": 0.75}
+{"dpsnr": 10.095505028035518, "id": 32, "input": "E:/ReAct-IR/data/DayRainDrop/Blur/00208/00024.png", "action": "A_DEDROP", "scale": 1.0}
