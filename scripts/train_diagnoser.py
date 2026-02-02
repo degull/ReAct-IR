@@ -1,6 +1,10 @@
-# 라벨 JSON으로 Diagnoser 학습
 # E:/ReAct-IR/scripts/train_diagnoser.py
-# 상태인식 -> VLM (CLIP, BLIP, vision encoder) | 순수 ViT or ViT-H/14 같은 구조
+# ------------------------------------------------------------
+# Label JSON (action-as-label) based Diagnoser Training
+# Output: logits (B,5) + degradation map m0 (B,5,h,w)
+# Models: vit_map / cnn_map
+# Checkpoint naming: epoch_001_L0.0659_P22.51_S0.7794.pth
+# ------------------------------------------------------------
 import os
 import sys
 import time
@@ -33,7 +37,6 @@ from datasets.lora_dataset import (
     build_action_pairs,
 )
 
-
 # --------------------------------------------------
 # Optional skimage metrics (not required)
 # --------------------------------------------------
@@ -47,7 +50,6 @@ except Exception:
 # ============================================================
 # Action / Label mapping
 # ============================================================
-# Tool action names you used in ToolBank (internal)
 ACTIONS_INTERNAL = ["A_DEBLUR", "A_DERAIN", "A_DESNOW", "A_DEHAZE", "A_DEDROP"]
 
 # label order: [blur, rain, snow, haze, drop]
@@ -60,7 +62,6 @@ ACTION_TO_LABEL_INDEX = {
     "A_DEDROP": 4,
 }
 
-# folder aliases are what you used for LoRA ckpt dirs
 ALIAS_TO_INTERNAL = {
     "deblur": "A_DEBLUR",
     "derain": "A_DERAIN",
@@ -95,6 +96,13 @@ def format_time(sec: float) -> str:
     return f"{m}m{s:02d}s"
 
 
+def _to_float(x):
+    try:
+        return float(x)
+    except Exception:
+        return 0.0
+
+
 @torch.no_grad()
 def multilabel_metrics_from_logits(logits: torch.Tensor, targets: torch.Tensor, thr: float = 0.5) -> Dict[str, float]:
     """
@@ -104,12 +112,10 @@ def multilabel_metrics_from_logits(logits: torch.Tensor, targets: torch.Tensor, 
     probs = torch.sigmoid(logits)
     preds = (probs >= thr).float()
 
-    # per-label accuracy
-    correct = (preds == targets).float()  # (B,5)
-    acc_per_label = correct.mean(dim=0)   # (5,)
+    correct = (preds == targets).float()
+    acc_per_label = correct.mean(dim=0)
     acc_macro = acc_per_label.mean().item()
 
-    # exact match ratio (all 5 labels correct)
     exact = (correct.min(dim=1).values).mean().item()
 
     out = {"acc_macro": float(acc_macro), "exact_match": float(exact)}
@@ -118,13 +124,26 @@ def multilabel_metrics_from_logits(logits: torch.Tensor, targets: torch.Tensor, 
     return out
 
 
+def make_ckpt_name(epoch: int, val_loss: float, val_acc_macro: float, val_exact: float) -> str:
+    """
+    Match your style:
+      epoch_001_L0.0659_P22.51_S0.7794.pth
+
+    Here:
+      L = val_loss
+      P = val_acc_macro * 100 (so it looks like "22.51")
+      S = val_exact_match
+    """
+    P = val_acc_macro * 100.0
+    return f"epoch_{epoch:03d}_L{val_loss:.4f}_P{P:.2f}_S{val_exact:.4f}.pth"
+
+
 # ============================================================
-# Dataset: reuse LoRAPairedDataset but only return input + label
+# Dataset
 # ============================================================
 class DiagnoserDataset(Dataset):
     """
     build_action_pairs()로 얻은 inp_path를 직접 읽어서 Tensor로 반환한다.
-    LoRAPairedDataset 반환 타입(문자열 토큰 등) 이슈를 원천 차단.
     """
 
     def __init__(
@@ -157,7 +176,6 @@ class DiagnoserDataset(Dataset):
                 pairs = pairs[:max_per_action]
 
             for inp_path, gt_path, meta in pairs:
-                # inp_path should be an actual path
                 self.items.append((inp_path, action))
 
             self.stats_by_action[action] = len(pairs)
@@ -169,11 +187,9 @@ class DiagnoserDataset(Dataset):
 
     def _load_rgb_tensor(self, path: str) -> torch.Tensor:
         img = Image.open(path).convert("RGB")
-
         W, H = img.size
         ph = pw = self.patch
 
-        # crop or resize
         if (H >= ph) and (W >= pw):
             if self.augment:
                 x0 = random.randint(0, W - pw)
@@ -185,15 +201,14 @@ class DiagnoserDataset(Dataset):
         else:
             img = img.resize((pw, ph), resample=Image.BILINEAR)
 
-        # simple aug
         if self.augment:
             if random.random() < 0.5:
                 img = img.transpose(Image.FLIP_LEFT_RIGHT)
             if random.random() < 0.5:
                 img = img.transpose(Image.FLIP_TOP_BOTTOM)
 
-        arr = np.array(img).astype(np.float32) / 255.0  # HWC
-        x = torch.from_numpy(arr).permute(2, 0, 1).contiguous()  # CHW
+        arr = np.array(img).astype(np.float32) / 255.0
+        x = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
         return x
 
     def __getitem__(self, idx: int):
@@ -207,8 +222,6 @@ class DiagnoserDataset(Dataset):
         return inp, y, meta
 
 
-
-
 def collate_diagnoser(batch):
     inps = torch.stack([b[0] for b in batch], dim=0)
     ys = torch.stack([b[1] for b in batch], dim=0)
@@ -216,15 +229,14 @@ def collate_diagnoser(batch):
     return inps, ys, metas
 
 
-
-
 # ============================================================
-# Model: simple ViT-like (patch embed + transformer blocks) OR small CNN
+# Models (logits + map)
 # ============================================================
-class TinyViTDiagnoser(nn.Module):
+class ViTMapDiagnoser(nn.Module):
     """
-    A lightweight ViT-like classifier for 256x256 patches.
-    This avoids external deps (timm). Works well enough for score-vector diagnosis.
+    Lightweight ViT-like map diagnoser.
+    - produces patch-level logits -> m0 map (B,5,Hp,Wp)
+    - global logits = 0.5*(mean_pool + max_pool)
     """
 
     def __init__(
@@ -243,17 +255,13 @@ class TinyViTDiagnoser(nn.Module):
         assert img_size % patch_size == 0, "img_size must be divisible by patch_size"
         self.img_size = img_size
         self.patch_size = patch_size
-        self.num_patches = (img_size // patch_size) * (img_size // patch_size)
+        self.grid = img_size // patch_size
+        self.num_patches = self.grid * self.grid
 
-        # patch embedding via conv
         self.patch_embed = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size, bias=True)
-
-        # cls token + pos embed
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, 1 + self.num_patches, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
         self.pos_drop = nn.Dropout(dropout)
 
-        # transformer encoder blocks
         enc_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
             nhead=num_heads,
@@ -264,54 +272,64 @@ class TinyViTDiagnoser(nn.Module):
             norm_first=True,
         )
         self.encoder = nn.TransformerEncoder(enc_layer, num_layers=depth)
-
         self.norm = nn.LayerNorm(embed_dim)
-        self.head = nn.Linear(embed_dim, num_labels)
 
-        # init
-        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        self.map_head = nn.Linear(embed_dim, num_labels)
+
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
-        nn.init.trunc_normal_(self.head.weight, std=0.02)
-        nn.init.zeros_(self.head.bias)
+        nn.init.trunc_normal_(self.map_head.weight, std=0.02)
+        nn.init.zeros_(self.map_head.bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor):
         # x: (B,3,H,W)
         B, C, H, W = x.shape
-        # patchify
-        x = self.patch_embed(x)  # (B,embed_dim,H/p,W/p)
-        x = x.flatten(2).transpose(1, 2)  # (B, num_patches, embed_dim)
+        x = self.patch_embed(x)                  # (B,D,Hp,Wp)
+        x = x.flatten(2).transpose(1, 2)         # (B,N,D)
 
-        cls = self.cls_token.expand(B, -1, -1)  # (B,1,embed_dim)
-        x = torch.cat([cls, x], dim=1)          # (B,1+num_patches,embed_dim)
-        x = x + self.pos_embed[:, : x.size(1)]
+        x = x + self.pos_embed[:, :x.size(1)]
         x = self.pos_drop(x)
 
-        x = self.encoder(x)                     # (B,1+num_patches,embed_dim)
-        x = self.norm(x[:, 0])                  # take cls token
-        logits = self.head(x)                   # (B,5)
-        return logits
+        x = self.encoder(x)                      # (B,N,D)
+        x = self.norm(x)
+
+        patch_logits = self.map_head(x)          # (B,N,5)
+        m0 = patch_logits.transpose(1, 2).reshape(B, 5, self.grid, self.grid)  # (B,5,Hp,Wp)
+
+        logit_mean = m0.mean(dim=(2, 3))
+        logit_max = m0.amax(dim=(2, 3))
+        logits = 0.5 * (logit_mean + logit_max)  # (B,5)
+
+        return logits, m0
 
 
-class TinyCNNDiagnoser(nn.Module):
+class CNNMapDiagnoser(nn.Module):
     """
-    Simple CNN baseline (faster, often surprisingly strong).
+    Simple CNN map diagnoser.
+    - m0: (B,5,h,w)
+    - logits = 0.5*(mean_pool + max_pool)
     """
+
     def __init__(self, num_labels: int = 5, width: int = 64):
         super().__init__()
         w = width
-        self.net = nn.Sequential(
+        self.feat = nn.Sequential(
             nn.Conv2d(3, w, 3, 1, 1), nn.ReLU(inplace=True),
             nn.Conv2d(w, w, 3, 2, 1), nn.ReLU(inplace=True),          # /2
             nn.Conv2d(w, 2*w, 3, 2, 1), nn.ReLU(inplace=True),        # /4
             nn.Conv2d(2*w, 4*w, 3, 2, 1), nn.ReLU(inplace=True),      # /8
             nn.Conv2d(4*w, 4*w, 3, 2, 1), nn.ReLU(inplace=True),      # /16
-            nn.AdaptiveAvgPool2d((1, 1)),
         )
-        self.head = nn.Linear(4*w, num_labels)
+        self.map_head = nn.Conv2d(4*w, num_labels, kernel_size=1, stride=1, padding=0)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        f = self.net(x).flatten(1)
-        return self.head(f)
+    def forward(self, x: torch.Tensor):
+        f = self.feat(x)
+        m0 = self.map_head(f)  # (B,5,h,w)
+
+        logit_mean = m0.mean(dim=(2, 3))
+        logit_max = m0.amax(dim=(2, 3))
+        logits = 0.5 * (logit_mean + logit_max)
+
+        return logits, m0
 
 
 # ============================================================
@@ -336,7 +354,7 @@ class TrainCfg:
     channels_last: bool
     tf32: bool
 
-    model: str  # "vit" or "cnn"
+    model: str  # "vit_map" or "cnn_map"
     vit_patch: int
     vit_dim: int
     vit_depth: int
@@ -369,7 +387,7 @@ def parse_args() -> TrainCfg:
     ap.add_argument("--channels_last", type=int, default=1)
     ap.add_argument("--tf32", type=int, default=1)
 
-    ap.add_argument("--model", default="vit", choices=["vit", "cnn"])
+    ap.add_argument("--model", default="vit_map", choices=["vit_map", "cnn_map"])
     ap.add_argument("--vit_patch", type=int, default=16)
     ap.add_argument("--vit_dim", type=int, default=384)
     ap.add_argument("--vit_depth", type=int, default=6)
@@ -423,13 +441,12 @@ def train_one_epoch(
     model.train()
     loss_sum = 0.0
     n = 0
-
-    # BCE with logits for multi-label
     bce = nn.BCEWithLogitsLoss()
 
     t0 = time.time()
     pbar = tqdm(loader, ncols=140, desc="Train")
 
+    last_m = None
     for it, (inp, y, metas) in enumerate(pbar, start=1):
         inp = inp.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
@@ -437,19 +454,19 @@ def train_one_epoch(
         opt.zero_grad(set_to_none=True)
 
         with autocast(device_type="cuda", dtype=torch.float16, enabled=(use_amp and device.type == "cuda")):
-            logits = model(inp)
+            logits, m0 = model(inp)  # <-- (logits, map)
             loss = bce(logits, y)
 
         scaler.scale(loss).backward()
         scaler.step(opt)
         scaler.update()
 
-        loss_sum += float(loss.item()) * inp.size(0)
-        n += int(inp.size(0))
+        bs = int(inp.size(0))
+        loss_sum += float(loss.item()) * bs
+        n += bs
 
-        # quick metrics
         with torch.no_grad():
-            m = multilabel_metrics_from_logits(logits.detach(), y, thr=thr)
+            last_m = multilabel_metrics_from_logits(logits.detach(), y, thr=thr)
 
         elapsed = time.time() - t0
         it_per_sec = it / max(elapsed, 1e-6)
@@ -457,13 +474,14 @@ def train_one_epoch(
 
         pbar.set_postfix({
             "L": f"{loss_sum/max(n,1):.4f}",
-            "acc": f"{m['acc_macro']:.3f}",
-            "ex": f"{m['exact_match']:.3f}",
+            "acc": f"{(last_m['acc_macro'] if last_m else 0):.3f}",
+            "ex": f"{(last_m['exact_match'] if last_m else 0):.3f}",
             "ETA": format_time(eta_sec),
         })
 
     out = {"loss": float(loss_sum / max(n, 1))}
-    out.update({k: float(v) for k, v in m.items()})
+    if last_m is not None:
+        out.update({k: float(v) for k, v in last_m.items()})
     return out
 
 
@@ -480,6 +498,7 @@ def eval_one_epoch(
     n = 0
     bce = nn.BCEWithLogitsLoss()
 
+    # accumulate metrics as average over batches
     m_accum = None  # type: Optional[Dict[str, float]]
 
     pbar = tqdm(loader, ncols=140, desc="Val ")
@@ -488,11 +507,12 @@ def eval_one_epoch(
         y = y.to(device, non_blocking=True)
 
         with autocast(device_type="cuda", dtype=torch.float16, enabled=(use_amp and device.type == "cuda")):
-            logits = model(inp)
+            logits, m0 = model(inp)
             loss = bce(logits, y)
 
-        loss_sum += float(loss.item()) * inp.size(0)
-        n += int(inp.size(0))
+        bs = int(inp.size(0))
+        loss_sum += float(loss.item()) * bs
+        n += bs
 
         m = multilabel_metrics_from_logits(logits, y, thr=thr)
         m_accum = m if m_accum is None else {k: (m_accum[k] + m[k]) for k in m_accum.keys()}
@@ -528,6 +548,7 @@ def main():
     print(f"[Speed] tf32={cfg.tf32} channels_last={cfg.channels_last} amp={cfg.use_amp}")
     print("[Labels]", LABEL_NAMES)
     print("[Actions]", ACTIONS_INTERNAL)
+    print("[Model]", cfg.model)
 
     safe_makedirs(cfg.out_dir)
 
@@ -576,8 +597,8 @@ def main():
     )
 
     # ---------------- model ----------------
-    if cfg.model == "vit":
-        model = TinyViTDiagnoser(
+    if cfg.model == "vit_map":
+        model = ViTMapDiagnoser(
             img_size=cfg.patch,
             patch_size=cfg.vit_patch,
             embed_dim=cfg.vit_dim,
@@ -586,7 +607,7 @@ def main():
             num_labels=len(LABEL_NAMES),
         )
     else:
-        model = TinyCNNDiagnoser(num_labels=len(LABEL_NAMES), width=cfg.cnn_width)
+        model = CNNMapDiagnoser(num_labels=len(LABEL_NAMES), width=cfg.cnn_width)
 
     model.to(device)
     if cfg.channels_last and device.type == "cuda":
@@ -596,9 +617,12 @@ def main():
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scaler = GradScaler(enabled=(cfg.use_amp and device.type == "cuda"))
 
+    # ---------------- output paths ----------------
     best_val = 1e9
-    best_path = os.path.join(cfg.out_dir, "diagnoser_best.pth")
     last_path = os.path.join(cfg.out_dir, "diagnoser_last.pth")
+    best_path = os.path.join(cfg.out_dir, "diagnoser_best.pth")
+
+    safe_makedirs(cfg.out_dir)
 
     print("\n[Train] start")
     for epoch in range(1, cfg.epochs + 1):
@@ -607,24 +631,43 @@ def main():
         tr = train_one_epoch(model, loader_tr, opt, scaler, device, cfg.use_amp, thr=cfg.thr)
         va = eval_one_epoch(model, loader_va, device, cfg.use_amp, thr=cfg.thr)
 
-        print(f"\n[Epoch {epoch:03d}/{cfg.epochs}] "
-              f"train: L={tr['loss']:.4f} acc={tr['acc_macro']:.3f} ex={tr['exact_match']:.3f} | "
-              f"val: L={va['loss']:.4f} acc={va.get('acc_macro',0):.3f} ex={va.get('exact_match',0):.3f} | "
-              f"time={format_time(time.time()-t0)}")
+        val_loss = _to_float(va.get("loss", 0.0))
+        val_acc = _to_float(va.get("acc_macro", 0.0))
+        val_ex = _to_float(va.get("exact_match", 0.0))
+
+        print(
+            f"\n[Epoch {epoch:03d}/{cfg.epochs}] "
+            f"train: L={tr['loss']:.4f} acc={tr.get('acc_macro',0):.3f} ex={tr.get('exact_match',0):.3f} | "
+            f"val: L={val_loss:.4f} acc={val_acc:.3f} ex={val_ex:.3f} | "
+            f"time={format_time(time.time()-t0)}"
+        )
 
         ckpt = {
             "epoch": epoch,
             "cfg": vars(cfg),
             "model": cfg.model,
             "label_names": LABEL_NAMES,
+            # save in both keys to be robust with various loaders
             "state_dict": model.state_dict(),
+            "model_state_dict": model.state_dict(),
             "train": tr,
             "val": va,
+            # note: this diagnoser outputs (logits,m0); inference should use m0 for m0_mean/max
+            "output_signature": "(logits[B,5], m0[B,5,h,w])",
         }
+
+        # save last (stable name)
         torch.save(ckpt, last_path)
 
-        if va["loss"] < best_val:
-            best_val = va["loss"]
+        # save per-epoch (your style name)
+        named = make_ckpt_name(epoch, val_loss, val_acc, val_ex)
+        named_path = os.path.join(cfg.out_dir, named)
+        torch.save(ckpt, named_path)
+        print(f"[Save] epoch_ckpt -> {named_path}")
+
+        # save best (by val loss)
+        if val_loss < best_val:
+            best_val = val_loss
             torch.save(ckpt, best_path)
             print(f"[Save] BEST -> {best_path} (val_loss={best_val:.6f})")
 
@@ -638,11 +681,23 @@ if __name__ == "__main__":
 
 
 """
+Example:
+
 python scripts/train_diagnoser.py `
   --data_root "E:/ReAct-IR/data" `
   --out_dir "E:/ReAct-IR/checkpoints/diagnoser" `
   --split_train train --split_val test `
-  --model vit `
+  --model vit_map `
+  --vit_patch 16 --vit_dim 384 --vit_depth 6 --vit_heads 6 `
   --epochs 10 --batch_size 16 --num_workers 4
 
+Or CNN:
+
+python scripts/train_diagnoser.py `
+  --data_root "E:/ReAct-IR/data" `
+  --out_dir "E:/ReAct-IR/checkpoints/diagnoser" `
+  --split_train train --split_val test `
+  --model cnn_map `
+  --cnn_width 64 `
+  --epochs 10 --batch_size 32 --num_workers 4
 """
