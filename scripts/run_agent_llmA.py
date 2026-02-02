@@ -191,53 +191,151 @@ def import_diagnoser_map_fuzzy() -> Any:
     raise ImportError("Failed to import DiagnoserMap by fuzzy scan.")
 
 
-def import_valuehead_fuzzy() -> Any:
-    module_candidates = [
-        "models.valuehead.valuehead",
-        "models.valuehead",
-        "models.value_head",
-        "models.value",
-    ]
-    for mod in module_candidates:
-        try:
-            m = importlib.import_module(mod)
-            if hasattr(m, "ValueHead"):
-                return getattr(m, "ValueHead")
-            return pick_class_fuzzy(m, must_contain=["value", "head"])
-        except Exception:
-            pass
-
-    py_files = scan_python_files(PROJECT_ROOT)
-    hint_files = []
-    for p in py_files:
-        bn = os.path.basename(p).lower()
-        if any(k in bn for k in ["valuehead", "train_valuehead", "value_head", "value"]):
-            hint_files.append(p)
-
-    search_list = hint_files + [p for p in py_files if p not in hint_files]
-
-    for py_path in search_list:
-        try:
-            m = load_module_from_file(py_path, f"_dyn_{os.path.splitext(os.path.basename(py_path))[0]}")
-            if hasattr(m, "ValueHead"):
-                return getattr(m, "ValueHead")
-            return pick_class_fuzzy(m, must_contain=["value", "head"])
-        except Exception:
-            continue
-
-    raise ImportError("Failed to import ValueHead by fuzzy scan.")
-
-
 # =========================
 # Load helpers
 # =========================
 def load_ckpt_state(path: str):
     ckpt = torch.load(path, map_location="cpu")
     if isinstance(ckpt, dict):
-        for k in ["model", "state_dict", "net", "weights"]:
+        for k in ["model", "state_dict", "net", "weights", "model_state_dict"]:
             if k in ckpt and isinstance(ckpt[k], dict):
                 return ckpt[k]
     return ckpt
+
+
+# =========================
+# Diagnoser (vit_map / cnn_map) - must match train_diagnoser.py
+# =========================
+class ViTMapDiagnoser(nn.Module):
+    def __init__(
+        self,
+        img_size: int = 256,
+        patch_size: int = 16,
+        in_chans: int = 3,
+        embed_dim: int = 384,
+        depth: int = 6,
+        num_heads: int = 6,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        num_labels: int = 5,
+    ):
+        super().__init__()
+        assert img_size % patch_size == 0, "img_size must be divisible by patch_size"
+        self.img_size = int(img_size)
+        self.patch_size = int(patch_size)
+        self.grid = self.img_size // self.patch_size
+        self.num_patches = self.grid * self.grid
+
+        self.patch_embed = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size, bias=True)
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
+        self.pos_drop = nn.Dropout(dropout)
+
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,
+            dim_feedforward=int(embed_dim * mlp_ratio),
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=depth)
+        self.norm = nn.LayerNorm(embed_dim)
+        self.map_head = nn.Linear(embed_dim, num_labels)
+
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.map_head.weight, std=0.02)
+        nn.init.zeros_(self.map_head.bias)
+
+    def forward(self, x: torch.Tensor):
+        B, C, H, W = x.shape
+        x = self.patch_embed(x)                  # (B,D,Hp,Wp)
+        x = x.flatten(2).transpose(1, 2)         # (B,N,D)
+        x = x + self.pos_embed[:, :x.size(1)]
+        x = self.pos_drop(x)
+
+        x = self.encoder(x)                      # (B,N,D)
+        x = self.norm(x)
+
+        patch_logits = self.map_head(x)          # (B,N,5)
+        m0 = patch_logits.transpose(1, 2).reshape(B, 5, self.grid, self.grid)  # (B,5,Hp,Wp)
+
+        logit_mean = m0.mean(dim=(2, 3))
+        logit_max  = m0.amax(dim=(2, 3))
+        logits = 0.5 * (logit_mean + logit_max)  # (B,5)
+        return logits, m0
+
+
+class CNNMapDiagnoser(nn.Module):
+    def __init__(self, num_labels: int = 5, width: int = 64):
+        super().__init__()
+        w = int(width)
+        self.img_size = 256  # just for compatibility; actual input can be resized externally
+        self.feat = nn.Sequential(
+            nn.Conv2d(3, w, 3, 1, 1), nn.ReLU(inplace=True),
+            nn.Conv2d(w, w, 3, 2, 1), nn.ReLU(inplace=True),          # /2
+            nn.Conv2d(w, 2*w, 3, 2, 1), nn.ReLU(inplace=True),        # /4
+            nn.Conv2d(2*w, 4*w, 3, 2, 1), nn.ReLU(inplace=True),      # /8
+            nn.Conv2d(4*w, 4*w, 3, 2, 1), nn.ReLU(inplace=True),      # /16
+        )
+        self.map_head = nn.Conv2d(4*w, num_labels, kernel_size=1, stride=1, padding=0)
+
+    def forward(self, x: torch.Tensor):
+        f = self.feat(x)
+        m0 = self.map_head(f)  # (B,5,h,w)
+        logit_mean = m0.mean(dim=(2, 3))
+        logit_max  = m0.amax(dim=(2, 3))
+        logits = 0.5 * (logit_mean + logit_max)
+        return logits, m0
+
+
+def load_diagnoser_from_ckpt(ckpt_path: str, device: str = DEVICE, strict: bool = True) -> nn.Module:
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    if not isinstance(ckpt, dict):
+        raise RuntimeError(f"Diagnoser ckpt must be dict, got {type(ckpt)}")
+
+    # model type
+    model_type = ckpt.get("model", None)
+    cfg = ckpt.get("cfg", {}) if isinstance(ckpt.get("cfg", {}), dict) else {}
+
+    if model_type is None:
+        model_type = cfg.get("model", None)
+    if model_type is None:
+        raise RuntimeError("Cannot find diagnoser model type in ckpt. Expected ckpt['model'] or ckpt['cfg']['model'].")
+
+    model_type = str(model_type)
+
+    # build model with exact hyperparams used in train_diagnoser.py
+    if model_type == "vit_map":
+        img_size   = int(cfg.get("patch", 256))
+        patch_size = int(cfg.get("vit_patch", 16))
+        dim        = int(cfg.get("vit_dim", 384))
+        depth      = int(cfg.get("vit_depth", 6))
+        heads      = int(cfg.get("vit_heads", 6))
+        model = ViTMapDiagnoser(
+            img_size=img_size,
+            patch_size=patch_size,
+            embed_dim=dim,
+            depth=depth,
+            num_heads=heads,
+            num_labels=5,
+        )
+    elif model_type == "cnn_map":
+        width = int(cfg.get("cnn_width", 64))
+        model = CNNMapDiagnoser(num_labels=5, width=width)
+    else:
+        raise RuntimeError(f"Unknown diagnoser model_type='{model_type}'. Expected 'vit_map' or 'cnn_map'.")
+
+    # state dict
+    sd = ckpt.get("state_dict", None)
+    if sd is None:
+        sd = ckpt.get("model_state_dict", None)
+    if sd is None:
+        sd = load_ckpt_state(ckpt_path)
+
+    model.load_state_dict(sd, strict=bool(strict))
+    model.to(device).eval()
+    return model
 
 
 def load_image(path: str) -> torch.Tensor:
@@ -308,11 +406,13 @@ def extract_s0_m0_from_diagnoser_output(
       s0      : [B,5]
       m0_mean : [B,5]
       m0_max  : [B,5]
-    Strategy:
-      - If diagnoser returns dict with keys for maps/stats, use them.
-      - If it returns a map tensor in dict, compute mean/max spatially.
-      - Otherwise, fallback m0_mean/m0_max = zeros.
+
+    Supports diagnoser output formats:
+      1) tensor logits: out = [B,5]
+      2) tuple/list: out = (logits[B,5], m0[B,5,h,w])
+      3) dict: out can contain {s/score/s0} and/or {m0/map/...} and/or {m0_mean,m0_max}
     """
+    # ---- s0 fallback ----
     s0 = s_t_fallback
     if s0.dim() == 1:
         s0 = s0.unsqueeze(0)
@@ -320,10 +420,34 @@ def extract_s0_m0_from_diagnoser_output(
 
     B = s0.shape[0]
     zeros = torch.zeros((B, 5), device=s0.device, dtype=s0.dtype)
-
     m0_mean = zeros
     m0_max = zeros
 
+    # (A) tuple/list output: (logits, m0)
+    if isinstance(out, (tuple, list)) and len(out) >= 2:
+        logits = out[0]
+        m0 = out[1]
+
+        if torch.is_tensor(logits):
+            if logits.dim() == 1:
+                logits = logits.unsqueeze(0)
+            s0 = logits[:, :5].to(device=s0.device, dtype=s0.dtype).contiguous()
+
+        if torch.is_tensor(m0) and m0.dim() == 4:
+            mm = m0[:, :5, :, :].to(device=s0.device, dtype=s0.dtype)
+            m0_mean = mm.mean(dim=(2, 3))
+            m0_max = mm.amax(dim=(2, 3))
+
+        s0 = _nan_to_zero(s0)
+        m0_mean = _nan_to_zero(m0_mean)
+        m0_max = _nan_to_zero(m0_max)
+
+        if int(debug) == 1:
+            if torch.allclose(m0_mean, zeros) and torch.allclose(m0_max, zeros):
+                dprint(1, "[DEBUG][Feat17] tuple out but m0 stats are zeros. Check m0 shape/channels.")
+        return s0, m0_mean, m0_max
+
+    # (B) dict output
     if isinstance(out, dict):
         # direct stats
         if "m0_mean" in out and torch.is_tensor(out["m0_mean"]):
@@ -331,6 +455,7 @@ def extract_s0_m0_from_diagnoser_output(
             if t.dim() == 1:
                 t = t.unsqueeze(0)
             m0_mean = t[:, :5].to(device=s0.device, dtype=s0.dtype).contiguous()
+
         if "m0_max" in out and torch.is_tensor(out["m0_max"]):
             t = out["m0_max"]
             if t.dim() == 1:
@@ -345,7 +470,7 @@ def extract_s0_m0_from_diagnoser_output(
                 m0 = out[k]
                 break
 
-        # sometimes nested
+        # sometimes nested dicts
         if m0 is None:
             for kk, vv in out.items():
                 if isinstance(vv, dict):
@@ -358,20 +483,22 @@ def extract_s0_m0_from_diagnoser_output(
 
         # compute spatial stats
         if torch.is_tensor(m0) and m0.dim() == 4:
-            # expected [B,5,H,W] (or more channels; take first 5)
             mm = m0[:, :5, :, :]
             m0_mean = mm.mean(dim=(2, 3))
             m0_max = mm.amax(dim=(2, 3))
 
-    # sanitize
+    # (C) tensor-only output: no map/stats -> zeros for m0
     s0 = _nan_to_zero(s0)
     m0_mean = _nan_to_zero(m0_mean)
     m0_max = _nan_to_zero(m0_max)
 
     if int(debug) == 1:
         if torch.allclose(m0_mean, zeros) and torch.allclose(m0_max, zeros):
-            dprint(1, "[DEBUG][Feat17] m0_mean/m0_max are ALL ZEROS (Diagnoser did not provide maps/stats). "
-                      "Planner may be less reliable unless diagnoser outputs m0.")
+            dprint(
+                1,
+                "[DEBUG][Feat17] m0_mean/m0_max are ALL ZEROS (Diagnoser did not provide maps/stats). "
+                "Planner may be less reliable unless diagnoser outputs m0."
+            )
 
     return s0, m0_mean, m0_max
 
@@ -401,63 +528,112 @@ def build_planner_feat17(
 
 
 # =========================
-# ValueHead(21) input builder (pragmatic)
-# v_in = [feat17, action_id_norm, scale, step_norm, bias] => 21
+# ValueHead(21) input builder (train_valuehead.py compatible)
 # =========================
-def build_value_feat21(
-    feat17: torch.Tensor,
-    action_id: int,
+def build_value_x21_trainstyle(
+    s0: torch.Tensor,
+    m0_mean: torch.Tensor,
+    m0_max: torch.Tensor,
+    action: str,
     scale: float,
-    step: int,
-    max_steps: int,
 ) -> torch.Tensor:
-    if feat17.dim() == 1:
-        feat17 = feat17.unsqueeze(0)
-    B = feat17.shape[0]
+    """
+    EXACTLY matches scripts/train_valuehead.py
 
-    a_norm = float(action_id) / max(1.0, float(len(ACTIONS) - 1))
-    step_norm = float(step) / max(1.0, float(max_steps - 1))
-    extra = torch.tensor([[a_norm, float(scale), step_norm, 1.0]], device=feat17.device, dtype=feat17.dtype).repeat(B, 1)
-    v = torch.cat([feat17, extra], dim=1)
-    # 17 + 4 = 21
-    assert v.shape[1] == 21, f"value feat must be 21-D, got {v.shape}"
-    v = _nan_to_zero(v)
-    return v
+    x = state_feat(15) + action_onehot(5) + scale(1) => 21
+      state_feat(15) = [s0(5), m0_mean(5), m0_max(5)]
+      action_onehot(5) uses ACTIONS order
+      scale is last dim
+    """
+    if s0.dim() == 1:
+        s0 = s0.unsqueeze(0)
+    if m0_mean.dim() == 1:
+        m0_mean = m0_mean.unsqueeze(0)
+    if m0_max.dim() == 1:
+        m0_max = m0_max.unsqueeze(0)
 
+    B = s0.shape[0]
+    device = s0.device
+    dtype = s0.dtype
 
-def tensor_to_scalar(v: Any) -> float:
-    if isinstance(v, (tuple, list)):
-        v = v[0]
-    if isinstance(v, dict):
-        for k in ["v", "value", "pred", "out"]:
-            if k in v:
-                v = v[k]
-                break
-        else:
-            for vv in v.values():
-                if torch.is_tensor(vv):
-                    v = vv
-                    break
+    # state_feat(15)
+    state15 = torch.cat([s0[:, :5], m0_mean[:, :5], m0_max[:, :5]], dim=1)  # [B,15]
 
-    if not torch.is_tensor(v):
-        try:
-            return float(v)
-        except Exception:
-            raise RuntimeError(f"Cannot convert output to float. type={type(v)}")
+    # action one-hot(5)
+    aoh = torch.zeros((B, len(ACTIONS)), device=device, dtype=dtype)
+    aid = ACTIONS.index(action)
+    aoh[:, aid] = 1.0
 
-    t = v.detach()
-    if t.numel() == 1:
-        return float(t.reshape(-1)[0].item())
-    flat = t.reshape(-1)
-    # if 2 elems etc, average is more stable
-    return float(flat.mean().item())
+    # scale(1)
+    sc = torch.full((B, 1), float(scale), device=device, dtype=dtype)
+
+    x21 = torch.cat([state15, aoh, sc], dim=1)  # [B,21]
+    assert x21.shape[1] == 21, f"x21 must be 21-D, got {x21.shape}"
+    return _nan_to_zero(x21)
 
 
 # =========================
-# Stop rules:
-#  A) diagnoser score threshold
-#  B) best value improvement patience
-#  + (optional) spread-based (aux)
+# ValueHeadMLP (FIXED: same as train_valuehead.py)
+# =========================
+class ValueHeadMLP(nn.Module):
+    def __init__(self, in_dim: int = 21, hidden: int = 256, depth: int = 3, dropout: float = 0.1, out_dim: int = 2):
+        super().__init__()
+        layers: List[nn.Module] = []
+        d = int(in_dim)
+        h = int(hidden)
+        dep = int(depth)
+        do = float(dropout)
+
+        for _ in range(dep):
+            layers += [nn.Linear(d, h), nn.GELU(), nn.Dropout(do)]
+            d = h
+        layers += [nn.Linear(d, int(out_dim))]
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+def load_valuehead_from_ckpt(ckpt_path: str, device: str = DEVICE) -> nn.Module:
+    """
+    Load valuehead ckpt saved by scripts/train_valuehead.py
+    Expected ckpt keys: { 'model': state_dict, 'args': {...} } or similar.
+    """
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    if not isinstance(ckpt, dict):
+        raise RuntimeError(f"ValueHead ckpt must be dict, got {type(ckpt)}")
+
+    # --- get args (train_valuehead.py typically stores args) ---
+    args = ckpt.get("args", {})
+    if not isinstance(args, dict):
+        args = {}
+
+    hidden = int(args.get("hidden", 256))
+    depth = int(args.get("depth", 3))
+    dropout = float(args.get("dropout", 0.1))
+
+    model = ValueHeadMLP(in_dim=21, hidden=hidden, depth=depth, dropout=dropout, out_dim=2)
+
+    # --- get state dict ---
+    sd = None
+    # prefer exact "model" key (train_valuehead.py)
+    if "model" in ckpt and isinstance(ckpt["model"], dict):
+        sd = ckpt["model"]
+    elif "state_dict" in ckpt and isinstance(ckpt["state_dict"], dict):
+        sd = ckpt["state_dict"]
+    elif "model_state_dict" in ckpt and isinstance(ckpt["model_state_dict"], dict):
+        sd = ckpt["model_state_dict"]
+    else:
+        sd = load_ckpt_state(ckpt_path)
+
+    # strict=True is key
+    model.load_state_dict(sd, strict=True)
+    model.to(device).eval()
+    return model
+
+
+# =========================
+# Stop rules
 # =========================
 class LLMPlannerA:
     """
@@ -601,55 +777,50 @@ def call_toolbank(toolbank: nn.Module, x: torch.Tensor, action: str, scale: floa
 
 
 # =========================
-# Candidate builder: Planner uses feat17 EXACTLY like eval_planner
-# ValueHead uses feat21 (pragmatic) unless it supports other signatures
+# Candidate builder
 # =========================
 def planner_forward_logits(planner_net: nn.Module, feat17: torch.Tensor) -> torch.Tensor:
-    # eval_planner PlannerActionNet.forward(x) expects x=[B,17]
     return planner_net(feat17)
 
 
 def valuehead_forward(
     value_head: nn.Module,
-    feat17: torch.Tensor,
+    s0: torch.Tensor,
+    m0_mean: torch.Tensor,
+    m0_max: torch.Tensor,
     action: str,
     scale: float,
-    step: int,
-    max_steps: int,
 ) -> float:
-    action_id = ACTIONS.index(action)
+    """
+    Train-time identical input:
+      x21 = [state15, action_onehot(5), scale]
+    Output:
+      y = [d_psnr, d_ssim]
+    We convert it to scalar value for ranking.
+    """
+    x21 = build_value_x21_trainstyle(
+        s0=s0, m0_mean=m0_mean, m0_max=m0_max,
+        action=action, scale=float(scale)
+    )
 
     with torch.no_grad():
-        # 1) if valuehead supports (feat17, action, scale)
-        try:
-            v = value_head(feat17, action, float(scale))
-            return tensor_to_scalar(v)
-        except Exception:
-            pass
+        y = value_head(x21)  # [B,2]
+        if isinstance(y, (tuple, list)):
+            y = y[0]
+        y = y.detach()
 
-        # 2) if supports (feat17, action_id, scale_tensor)
-        try:
-            a = torch.tensor([action_id], device=feat17.device, dtype=torch.long)
-            sc = torch.tensor([float(scale)], device=feat17.device, dtype=torch.float32)
-            v = value_head(feat17, a, sc)
-            return tensor_to_scalar(v)
-        except Exception:
-            pass
+        dpsnr = float(y[0, 0].item())
+        dssim = float(y[0, 1].item())
 
-        # 3) x-only (most common for MLP): build 21-D
-        x21 = build_value_feat21(
-            feat17=feat17,
-            action_id=action_id,
-            scale=float(scale),
-            step=int(step),
-            max_steps=int(max_steps),
-        )
-        v = value_head(x21)
-        return tensor_to_scalar(v)
-
+        # scalarize
+        value = dpsnr + 100.0 * dssim
+        return float(value)
 
 def build_candidates(
     feat17: torch.Tensor,
+    s0: torch.Tensor,
+    m0_mean: torch.Tensor,
+    m0_max: torch.Tensor,
     planner_net: nn.Module,
     value_head: nn.Module,
     scales: List[float],
@@ -658,6 +829,7 @@ def build_candidates(
     max_steps: int,
     debug: int = 0,
 ) -> Tuple[List[Dict[str, Any]], np.ndarray, np.ndarray]:
+
     with torch.no_grad():
         logits = planner_forward_logits(planner_net, feat17)
         if isinstance(logits, (tuple, list)):
@@ -665,7 +837,6 @@ def build_candidates(
         probs = torch.softmax(logits, dim=-1).detach().cpu().numpy()[0]
         logits_np = logits.detach().cpu().numpy()[0]
 
-    # sort by planner probs
     action_scores = list(zip(ACTIONS, probs, logits_np))
     action_scores.sort(key=lambda x: -x[1])
     keep = action_scores[:max(1, min(top_k, len(ACTIONS)))]
@@ -675,17 +846,45 @@ def build_candidates(
         for a, p, lg in keep:
             dprint(1, f"  {A2I[a]:02d}  {a:8s} prob={p:.4f}  logit={lg:.4f}")
 
+    # ------------------------------------------------------------
+    # Diagnoser prior (action guidance)
+    # s0 is assumed to be sigmoid-ed scores in [0,1] already.
+    # ------------------------------------------------------------
+    LABELS = ["blur", "rain", "snow", "haze", "drop"]
+    LABEL2ACTION = {
+        "blur": "A_DEBLUR",
+        "rain": "A_DERAIN",
+        "snow": "A_DESNOW",
+        "haze": "A_DEHAZE",
+        "drop": "A_DEDROP",
+    }
+
+    # dominant label by diagnoser score
+    dom_idx = int(torch.argmax(s0[0]).item())
+    dom_label = LABELS[dom_idx]
+    prior_action = LABEL2ACTION[dom_label]
+
+    prior_bonus = 0.8  # 튜닝 파라미터 (0.3~2.0 사이에서 시작 추천)
+    prior_other_penalty = 0.2  # optional small penalty
+
     candidates = []
     for action, _p, _lg in keep:
         for sc in scales:
             v = valuehead_forward(
                 value_head=value_head,
-                feat17=feat17,
+                s0=s0,
+                m0_mean=m0_mean,
+                m0_max=m0_max,
                 action=action,
                 scale=float(sc),
-                step=int(step),
-                max_steps=int(max_steps),
             )
+
+            # apply diagnoser-guided bonus/penalty
+            if action == prior_action:
+                v = v + prior_bonus
+            else:
+                v = v - prior_other_penalty
+
             candidates.append({"action": action, "scale": float(sc), "value": float(v)})
 
     candidates.sort(key=lambda x: -x["value"])
@@ -702,13 +901,6 @@ def instantiate_backbone(VETNetClass):
         raise RuntimeError(f"Failed to instantiate VETNet(): {e}")
 
 
-def instantiate_diagnoser(DiagnoserMapClass):
-    try:
-        return DiagnoserMapClass()
-    except Exception as e:
-        raise RuntimeError(f"Failed to instantiate DiagnoserMap(): {e}")
-
-
 def instantiate_planner(PlannerActionNetClass):
     try:
         return PlannerActionNetClass()
@@ -717,23 +909,6 @@ def instantiate_planner(PlannerActionNetClass):
             return PlannerActionNetClass(num_actions=len(ACTIONS))
         except Exception as e:
             raise RuntimeError(f"Failed to instantiate PlannerActionNet(): {e}")
-
-
-def instantiate_valuehead(ValueHeadClass):
-    for kwargs in [
-        {},
-        {"num_actions": len(ACTIONS)},
-        {"n_actions": len(ACTIONS)},
-        {"actions": len(ACTIONS)},
-    ]:
-        try:
-            return ValueHeadClass(**kwargs)
-        except Exception:
-            continue
-    try:
-        return ValueHeadClass(len(ACTIONS))
-    except Exception as e:
-        raise RuntimeError(f"Failed to instantiate ValueHead with common signatures: {e}")
 
 
 # =========================
@@ -755,8 +930,6 @@ def main(args):
         filename_hints=["vetnet.py", "vetnet_backbone.py", "backbone"],
     )
 
-    DiagnoserMap = import_diagnoser_map_fuzzy()
-
     ToolBank = import_first_with_file_fallback(
         symbol="ToolBank",
         module_candidates=[
@@ -766,15 +939,13 @@ def main(args):
         filename_hints=["toolbank.py", "toolbank"],
     )
 
-    ValueHead = import_valuehead_fuzzy()
-
     PlannerActionNet = import_first_with_file_fallback(
         symbol="PlannerActionNet",
         module_candidates=[
             "models.planner_action.planner_action",
             "models.planner_action",
             "models.planner.planner_action",
-            "scripts.eval_planner",  # allow importing from your eval_planner if in sys.path
+            "scripts.eval_planner",
         ],
         filename_hints=["planner_action.py", "planner_action_only.py", "planner", "eval_planner.py"],
     )
@@ -785,8 +956,8 @@ def main(args):
     backbone = instantiate_backbone(VETNet).to(DEVICE).eval()
     backbone.load_state_dict(load_ckpt_state(args.backbone_ckpt), strict=False)
 
-    diagnoser = instantiate_diagnoser(DiagnoserMap).to(DEVICE).eval()
-    diagnoser.load_state_dict(load_ckpt_state(args.diagnoser_ckpt), strict=False)
+    # Diagnoser: load once (strict=True)
+    diagnoser = load_diagnoser_from_ckpt(args.diagnoser_ckpt, device=DEVICE, strict=True)
 
     try:
         toolbank = ToolBank(backbone=backbone, lora_root=args.toolbank_lora_root).to(DEVICE).eval()
@@ -796,9 +967,10 @@ def main(args):
         except Exception as e:
             raise RuntimeError(f"Failed to instantiate ToolBank with both signatures: {e}")
 
-    valuehead = instantiate_valuehead(ValueHead).to(DEVICE).eval()
-    valuehead.load_state_dict(load_ckpt_state(args.valuehead_ckpt), strict=False)
+    # ValueHead: load EXACT train_valuehead model (strict=True)
+    valuehead = load_valuehead_from_ckpt(args.valuehead_ckpt, device=DEVICE)
 
+    # Planner: keep your existing load (strict=False for now)
     planner = instantiate_planner(PlannerActionNet).to(DEVICE).eval()
     planner.load_state_dict(load_ckpt_state(args.planner_ckpt), strict=False)
 
@@ -818,7 +990,7 @@ def main(args):
     print(f"[Input] x shape = {tuple(x.shape)}")
     print(f"[Diagnoser] expected img_size = {diag_size} (mode={args.diag_mode})")
     print(f"[Planner]  expected state_dim = 17 (fixed by eval_planner.build_feat)")
-    print(f"[ValueHead] expected state_dim = 21 (using feat17+action_id+scale+step+bias unless ValueHead supports other signatures)")
+    print(f"[ValueHead] expected state_dim = 21 (train_valuehead.py compatible; strict=True)")
     print(f"[StopRule] spread_stop_delta={args.stop_delta}, min_steps={args.min_steps}, "
           f"score_thresh={args.stop_score_thresh}, patience={args.stop_patience}, eps={args.stop_improve_eps}")
 
@@ -834,15 +1006,16 @@ def main(args):
 
         with torch.no_grad():
             out = diagnoser(x_diag)
+
+            # s_t extraction for score_max (works for tensor / tuple / dict)
             if isinstance(out, (tuple, list)):
                 s_t = out[0]
             elif isinstance(out, dict):
                 s_t = out.get("s", out.get("score", None))
                 if s_t is None:
-                    # fallback: some diagnosers return 's0'
                     s_t = out.get("s0", None)
                 if s_t is None:
-                    raise RuntimeError("DiagnoserMap dict output has no key in {s, score, s0}.")
+                    raise RuntimeError("Diagnoser dict output has no key in {s, score, s0}.")
             else:
                 s_t = out
 
@@ -851,15 +1024,21 @@ def main(args):
         if s_t.dim() == 1:
             s_t = s_t.unsqueeze(0)
 
-        # Debug: raw/sigmoid/softmax (helps detect if logits)
+        # Debug: raw/sigmoid/softmax
         if args.debug == 1:
             s_raw = s_t.detach()
             dprint(1, "[DEBUG][Diagnoser] raw:", s_raw.cpu().numpy())
             dprint(1, "[DEBUG][Diagnoser] sigmoid:", torch.sigmoid(s_raw).cpu().numpy())
             dprint(1, "[DEBUG][Diagnoser] softmax:", torch.softmax(s_raw, dim=-1).cpu().numpy())
 
-        # 2) Build Planner feat17 EXACTLY like eval_planner.build_feat()
+        # 2) Build feat17
         s0, m0_mean, m0_max = extract_s0_m0_from_diagnoser_output(out, s_t, debug=args.debug)
+
+        # normalize to probability space
+        s0 = torch.sigmoid(s0)
+        m0_mean = torch.sigmoid(m0_mean)
+        m0_max = torch.sigmoid(m0_max)
+
         feat17 = build_planner_feat17(
             s0=s0,
             m0_mean=m0_mean,
@@ -875,12 +1054,15 @@ def main(args):
             dprint(1, f"[DEBUG][Feat17] m0_max  = {m0_max.detach().cpu().numpy()}")
             dprint(1, f"[DEBUG][Feat17] baseline_psnr={args.baseline_psnr:.4f}, baseline_ssim={args.baseline_ssim:.6f}")
 
-        # "score_max" for stop rule A
-        score_max = float(s_t.detach().max().item())
+        # score_max for stop rule A
+        score_max = float(torch.sigmoid(s_t.detach()).max().item())
 
-        # 3) Candidates (planner probs -> valuehead value)
+        # 3) Candidates
         candidates, probs, logits_np = build_candidates(
             feat17=feat17,
+            s0=s0,
+            m0_mean=m0_mean,
+            m0_max=m0_max,
             planner_net=planner,
             value_head=valuehead,
             scales=args.scales,
@@ -889,29 +1071,36 @@ def main(args):
             max_steps=args.max_steps,
             debug=args.debug,
         )
+
         print("Top candidates:", candidates[:min(5, len(candidates))])
 
-        # Debug: full action×scale value table
+        # Debug: full action×scale table
         if args.debug == 1:
             dprint(1, "[DEBUG][ValueHead] action×scale value table:")
             for a in ACTIONS:
                 row = []
                 for sc in args.scales:
-                    v = valuehead_forward(valuehead, feat17, a, float(sc), step=step, max_steps=args.max_steps)
+                    v = valuehead_forward(
+                        value_head=valuehead,
+                        s0=s0,
+                        m0_mean=m0_mean,
+                        m0_max=m0_max,
+                        action=a,
+                        scale=float(sc),
+                    )
                     row.append((float(sc), float(v)))
                 row_str = ", ".join([f"{s:.2f}:{v:+.4f}" for s, v in row])
                 dprint(1, f"  {a}: {row_str}")
 
-        # 4) LLM choose (best value) + spread auxiliary stop
+        # 4) Choose + stop rules
         decision = llm.choose(candidates, history_len=len(history))
 
-        # ---- stop bookkeeping A/B (your “정석 stop”) ----
         # A) diagnoser 기반 stop
         if score_max < args.stop_score_thresh and step >= args.min_steps:
             decision["stop"] = True
             decision["reason"] += f" | stop: score_max={score_max:.4f} < {args.stop_score_thresh:.4f}"
 
-        # B) best value 개선이 없으면 stop (patience)
+        # B) valuehead best value no improve
         best_v = float(candidates[0]["value"]) if len(candidates) > 0 else -1e18
         if best_value_prev is None:
             best_value_prev = best_v
@@ -934,11 +1123,11 @@ def main(args):
             print("Stop triggered.")
             break
 
-        # 6) Tool apply
+        # 6) Apply tool
         with torch.no_grad():
             x = call_toolbank(toolbank, x, decision["action"], decision["scale"])
 
-        # 7) Save step output
+        # 7) Save
         save_path = os.path.join(
             args.out_dir,
             f"step_{step:02d}_{decision['action']}_{decision['scale']:.2f}.png"
@@ -946,7 +1135,7 @@ def main(args):
         save_image(x, save_path)
         history.append(decision)
 
-    # trace 저장
+    # save trace
     trace_path = os.path.join(args.out_dir, "trace.json")
     with open(trace_path, "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2, ensure_ascii=False)
@@ -960,7 +1149,7 @@ if __name__ == "__main__":
     p.add_argument("--out_dir", required=True)
 
     p.add_argument("--backbone_ckpt", default="E:/ReAct-IR/checkpoints/backbone/best_backbone.pth")
-    p.add_argument("--diagnoser_ckpt", default="E:/ReAct-IR/checkpoints/diagnoser/diagnoser_map_best.pth")
+    p.add_argument("--diagnoser_ckpt", default="E:/ReAct-IR/checkpoints/diagnoser_1/diagnoser_map_best.pth")
     p.add_argument("--toolbank_lora_root", default="E:/ReAct-IR/checkpoints/toolbank_lora")
     p.add_argument("--valuehead_ckpt", default="E:/ReAct-IR/checkpoints/valuehead/valuehead_best.pth")
     p.add_argument("--planner_ckpt", default="E:/ReAct-IR/checkpoints/planner_action/planner_action_best.pth")
