@@ -1,8 +1,6 @@
+# scripts/infer_diagnoser_maps.py
 import os
-import sys
 import argparse
-from typing import Optional, Dict, Any, Tuple, List
-
 import numpy as np
 from PIL import Image
 
@@ -10,156 +8,23 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# --------------------------------------------------
-# Make project import-safe
-# --------------------------------------------------
-CUR_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.abspath(os.path.join(CUR_DIR, ".."))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
-
+# -----------------------
 LABEL_NAMES = ["blur", "rain", "snow", "haze", "drop"]
-IDX_TO_ACTION = ["A_DEBLUR", "A_DERAIN", "A_DESNOW", "A_DEHAZE", "A_DEDROP"]
 
-
-# ============================================================
-# Utils
-# ============================================================
-def safe_makedirs(p: str):
-    os.makedirs(p, exist_ok=True)
-
-
-def pil_open_rgb(path: str) -> Image.Image:
-    return Image.open(path).convert("RGB")
-
-
-def pil_open_gray(path: str) -> Image.Image:
-    return Image.open(path).convert("L")
-
-
-def pil_to_tensor_rgb(img: Image.Image) -> torch.Tensor:
-    arr = np.array(img).astype(np.float32) / 255.0  # HWC
-    x = torch.from_numpy(arr).permute(2, 0, 1).contiguous()  # CHW
-    return x
-
-
-def pil_to_tensor_mask(img: Image.Image) -> torch.Tensor:
-    arr = np.array(img).astype(np.float32)
-    if arr.max() > 1.0:
-        arr = arr / 255.0
-    x = torch.from_numpy(arr).unsqueeze(0).contiguous()  # (1,H,W)
-    return x
-
-
-def tensor_to_u8_rgb(x_chw: torch.Tensor) -> np.ndarray:
-    x = x_chw.detach().float().clamp(0, 1).cpu().permute(1, 2, 0).numpy()
-    return (x * 255.0 + 0.5).astype(np.uint8)
-
-
-def tensor_to_u8_gray(x_hw: torch.Tensor) -> np.ndarray:
-    x = x_hw.detach().float().clamp(0, 1).cpu().numpy()
-    return (x * 255.0 + 0.5).astype(np.uint8)
-
-
-def resize_to_square(img: Image.Image, size: int, is_mask: bool = False) -> Image.Image:
-    if img.size[0] == size and img.size[1] == size:
-        return img
-    res = Image.NEAREST if is_mask else Image.BILINEAR
-    return img.resize((size, size), resample=res)
-
-
-def infer_csd_mask_path(inp_path: str) -> Optional[str]:
-    """
-    CSD structure:
-      .../CSD/Train/Snow/xxx.tif  -> .../CSD/Train/Mask/xxx.tif
-      .../CSD/Test/Snow/xxx.tif   -> .../CSD/Test/Mask/xxx.tif
-    """
-    p = inp_path.replace("\\", "/")
-    lower = p.lower()
-    if "/csd/" not in lower:
-        return None
-    if "/snow/" not in lower:
-        return None
-
-    parts = p.split("/")
-    idx = None
-    for i in range(len(parts)):
-        if parts[i].lower() == "snow":
-            idx = i
-    if idx is None:
-        return None
-    parts[idx] = "Mask"
-    mask_path = "/".join(parts)
-
-    if os.path.exists(mask_path):
-        return mask_path
-
-    base, _ = os.path.splitext(mask_path)
-    for e in [".png", ".tif", ".tiff", ".jpg", ".jpeg", ".bmp"]:
-        cand = base + e
-        if os.path.exists(cand):
-            return cand
-    return None
-
-
-def norm01(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    mn = x.amin(dim=(-2, -1), keepdim=True)
-    mx = x.amax(dim=(-2, -1), keepdim=True)
-    return (x - mn) / (mx - mn + eps)
-
-
-def overlay_heatmap_on_image(img_u8: np.ndarray, heat_u8: np.ndarray, alpha: float = 0.45) -> np.ndarray:
-    """
-    img_u8: HWC uint8
-    heat_u8: HW uint8 (0-255)
-    Make a simple red-ish overlay without matplotlib.
-    """
-    h = heat_u8.astype(np.float32) / 255.0
-    base = img_u8.astype(np.float32) / 255.0
-
-    # red channel boost
-    overlay = base.copy()
-    overlay[..., 0] = np.clip(overlay[..., 0] + h * 0.85, 0, 1)
-    overlay[..., 1] = np.clip(overlay[..., 1] * (1 - h * 0.35), 0, 1)
-    overlay[..., 2] = np.clip(overlay[..., 2] * (1 - h * 0.35), 0, 1)
-
-    out = (base * (1 - alpha) + overlay * alpha)
-    return (out * 255.0 + 0.5).astype(np.uint8)
-
-
-def binarize_mask(x01: torch.Tensor, thr: float) -> torch.Tensor:
-    return (x01 >= thr).float()
-
-
-def compute_iou_dice_mae(pred01: torch.Tensor, gt01: torch.Tensor, thr: float = 0.5) -> Dict[str, float]:
-    """
-    pred01, gt01: (H,W) in [0,1]
-    """
-    p = binarize_mask(pred01, thr)
-    g = binarize_mask(gt01, thr)
-    inter = (p * g).sum().item()
-    union = (p + g - p * g).sum().item()
-    iou = inter / (union + 1e-6)
-    dice = (2 * inter) / ((p.sum().item() + g.sum().item()) + 1e-6)
-    mae = (pred01 - gt01).abs().mean().item()
-    return {"iou": float(iou), "dice": float(dice), "mae": float(mae)}
-
-
-# ============================================================
-# Model (must match train_diagnoser_map.py)
-# ============================================================
-class TinyViTDiagnoserMap(nn.Module):
+# -----------------------
+# Models (same as train_diagnoser.py)
+class ViTMapDiagnoser(nn.Module):
     def __init__(
         self,
-        img_size: int = 256,
-        patch_size: int = 16,
-        in_chans: int = 3,
-        embed_dim: int = 384,
-        depth: int = 6,
-        num_heads: int = 6,
-        mlp_ratio: float = 4.0,
-        dropout: float = 0.0,
-        num_labels: int = 5,
+        img_size=256,
+        patch_size=16,
+        in_chans=3,
+        embed_dim=384,
+        depth=6,
+        num_heads=6,
+        mlp_ratio=4.0,
+        dropout=0.0,
+        num_labels=5,
     ):
         super().__init__()
         assert img_size % patch_size == 0
@@ -169,9 +34,7 @@ class TinyViTDiagnoserMap(nn.Module):
         self.num_patches = self.grid * self.grid
 
         self.patch_embed = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size, bias=True)
-
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, 1 + self.num_patches, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
         self.pos_drop = nn.Dropout(dropout)
 
         enc_layer = nn.TransformerEncoderLayer(
@@ -184,190 +47,165 @@ class TinyViTDiagnoserMap(nn.Module):
             norm_first=True,
         )
         self.encoder = nn.TransformerEncoder(enc_layer, num_layers=depth)
-
         self.norm = nn.LayerNorm(embed_dim)
-        self.head_global = nn.Linear(embed_dim, num_labels)
-        self.head_map = nn.Conv2d(embed_dim, num_labels, kernel_size=1, stride=1, padding=0, bias=True)
+        self.map_head = nn.Linear(embed_dim, num_labels)
 
-        nn.init.trunc_normal_(self.cls_token, std=0.02)
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.map_head.weight, std=0.02)
+        nn.init.zeros_(self.map_head.bias)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x):
         B, C, H, W = x.shape
-        assert H == self.img_size and W == self.img_size, "input must be resized/cropped to img_size"
+        x = self.patch_embed(x)                  # (B,D,Hp,Wp)
+        x = x.flatten(2).transpose(1, 2)         # (B,N,D)
+        x = x + self.pos_embed[:, :x.size(1)]
+        x = self.pos_drop(x)
+        x = self.encoder(x)                      # (B,N,D)
+        x = self.norm(x)
 
-        t = self.patch_embed(x)                           # (B,D,g,g)
-        t_flat = t.flatten(2).transpose(1, 2)            # (B,N,D)
+        patch_logits = self.map_head(x)          # (B,N,5)
+        m0 = patch_logits.transpose(1, 2).reshape(B, 5, self.grid, self.grid)
 
-        cls = self.cls_token.expand(B, -1, -1)           # (B,1,D)
-        z = torch.cat([cls, t_flat], dim=1)              # (B,1+N,D)
-        z = z + self.pos_embed[:, : z.size(1)]
-        z = self.pos_drop(z)
-
-        z = self.encoder(z)                              # (B,1+N,D)
-
-        g = self.norm(z[:, 0])                           # (B,D)
-        logits_global = self.head_global(g)              # (B,5)
-
-        tokens = z[:, 1:]                                # (B,N,D)
-        tokens = tokens.transpose(1, 2).contiguous()     # (B,D,N)
-        tokens = tokens.view(B, -1, self.grid, self.grid)  # (B,D,g,g)
-
-        logits_low = self.head_map(tokens)               # (B,5,g,g)
-        logits_map = F.interpolate(logits_low, size=(self.img_size, self.img_size), mode="bilinear", align_corners=False)
-
-        return logits_global, logits_map
+        logit_mean = m0.mean(dim=(2, 3))
+        logit_max = m0.amax(dim=(2, 3))
+        logits = 0.5 * (logit_mean + logit_max)
+        return logits, m0
 
 
-def load_ckpt(model: nn.Module, ckpt_path: str):
-    ckpt = torch.load(ckpt_path, map_location="cpu")
-    sd = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
+class CNNMapDiagnoser(nn.Module):
+    def __init__(self, num_labels=5, width=64):
+        super().__init__()
+        w = width
+        self.feat = nn.Sequential(
+            nn.Conv2d(3, w, 3, 1, 1), nn.ReLU(inplace=True),
+            nn.Conv2d(w, w, 3, 2, 1), nn.ReLU(inplace=True),
+            nn.Conv2d(w, 2*w, 3, 2, 1), nn.ReLU(inplace=True),
+            nn.Conv2d(2*w, 4*w, 3, 2, 1), nn.ReLU(inplace=True),
+            nn.Conv2d(4*w, 4*w, 3, 2, 1), nn.ReLU(inplace=True),
+        )
+        self.map_head = nn.Conv2d(4*w, num_labels, 1, 1, 0)
 
-    # support older "head.*" -> "head_global.*"
-    if "head.weight" in sd and "head_global.weight" not in sd:
-        sd2 = dict(sd)
-        sd2["head_global.weight"] = sd2.pop("head.weight")
-        sd2["head_global.bias"] = sd2.pop("head.bias")
-        sd = sd2
-
-    missing, unexpected = model.load_state_dict(sd, strict=False)
-    return missing, unexpected, ckpt
+    def forward(self, x):
+        f = self.feat(x)
+        m0 = self.map_head(f)
+        logit_mean = m0.mean(dim=(2, 3))
+        logit_max = m0.amax(dim=(2, 3))
+        logits = 0.5 * (logit_mean + logit_max)
+        return logits, m0
 
 
-# ============================================================
-# Main
-# ============================================================
-def parse_args():
+# -----------------------
+def load_rgb(path, size=256):
+    img = Image.open(path).convert("RGB")
+    img = img.resize((size, size), resample=Image.BILINEAR)
+    arr = np.array(img).astype(np.float32) / 255.0
+    x = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)  # (1,3,H,W)
+    return img, x
+
+def save_heatmap_gray(m, out_path):
+    # m: (H,W) float
+    m = m - m.min()
+    m = m / (m.max() + 1e-8)
+    im = (m * 255.0).astype(np.uint8)
+    Image.fromarray(im, mode="L").save(out_path)
+
+def save_overlay_red(base_rgb, heat, out_path, alpha=0.5):
+    # base_rgb: PIL RGB
+    # heat: (H,W) in [0,1]
+    base = np.array(base_rgb).astype(np.float32) / 255.0
+    h = heat[..., None]  # (H,W,1)
+    red = np.zeros_like(base)
+    red[..., 0] = 1.0
+    over = (1 - alpha*h) * base + (alpha*h) * red
+    over = np.clip(over, 0, 1)
+    Image.fromarray((over * 255).astype(np.uint8)).save(out_path)
+
+def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input", required=True, help="input image path")
-    ap.add_argument("--ckpt", default="E:/ReAct-IR/checkpoints/diagnoser/diagnoser_map_best.pth")
-    ap.add_argument("--out_dir", default="E:/ReAct-IR/results/diagnoser_map_infer")
+    ap.add_argument("--ckpt", required=True)
+    ap.add_argument("--image", required=True)
+    ap.add_argument("--outdir", default="E:/ReAct-IR/results/diagnoser_vis")
+    ap.add_argument("--device", default="cuda")
+    ap.add_argument("--model", default=None, choices=[None, "vit_map", "cnn_map"])
     ap.add_argument("--img_size", type=int, default=256)
 
-    # model hyperparams (must match training)
+    # vit params (match training if vit_map)
     ap.add_argument("--vit_patch", type=int, default=16)
     ap.add_argument("--vit_dim", type=int, default=384)
     ap.add_argument("--vit_depth", type=int, default=6)
     ap.add_argument("--vit_heads", type=int, default=6)
 
-    ap.add_argument("--thr_action", type=float, default=0.5, help="threshold for printing (sigmoid)")
-    ap.add_argument("--mask_thr", type=float, default=0.5, help="threshold for IoU/Dice binarization")
-    ap.add_argument("--save_all_labels", type=int, default=1, help="1: save heatmaps for all 5, 0: only top-1")
-    ap.add_argument("--alpha", type=float, default=0.45, help="overlay alpha")
-    ap.add_argument("--no_amp", type=int, default=0)
-    return ap.parse_args()
+    # cnn params (match training if cnn_map)
+    ap.add_argument("--cnn_width", type=int, default=64)
 
+    a = ap.parse_args()
+    os.makedirs(a.outdir, exist_ok=True)
 
-@torch.no_grad()
-def main():
-    args = parse_args()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("[Device]", device)
+    device = torch.device(a.device if torch.cuda.is_available() else "cpu")
+    ckpt = torch.load(a.ckpt, map_location="cpu")
 
-    safe_makedirs(args.out_dir)
+    # infer model type from ckpt if not provided
+    model_name = a.model or ckpt.get("model", "vit_map")
+    print("[CKPT model]", model_name)
 
-    # ---- load model
-    model = TinyViTDiagnoserMap(
-        img_size=args.img_size,
-        patch_size=args.vit_patch,
-        embed_dim=args.vit_dim,
-        depth=args.vit_depth,
-        num_heads=args.vit_heads,
-        num_labels=len(LABEL_NAMES),
-    ).to(device)
-    missing, unexpected, ckpt = load_ckpt(model, args.ckpt)
-    model.eval()
-    print("[CKPT]", args.ckpt)
-    print(f"[CKPT] loaded strict=False missing={len(missing)} unexpected={len(unexpected)}")
-    if len(missing) > 0:
-        print("  example missing:", missing[:10])
-    if len(unexpected) > 0:
-        print("  example unexpected:", unexpected[:10])
-
-    # ---- read input
-    inp_path = args.input
-    print("[Input]", inp_path)
-    img = pil_open_rgb(inp_path)
-    img_rs = resize_to_square(img, args.img_size, is_mask=False)
-    x = pil_to_tensor_rgb(img_rs).unsqueeze(0).to(device)
-
-    use_amp = (device.type == "cuda") and (args.no_amp == 0)
-    with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
-        logits_g, logits_m = model(x)  # (1,5), (1,5,H,W)
-
-    s0 = torch.sigmoid(logits_g[0]).float().cpu()  # (5,)
-    m0 = torch.sigmoid(logits_m[0]).float().cpu()  # (5,H,W)
-
-    # ---- print s0
-    s_line = "  ".join([f"{LABEL_NAMES[i]}={s0[i].item():.3f}" for i in range(5)])
-    print("[s0]", s_line)
-
-    top_idx = int(torch.argmax(s0).item())
-    pred_action = IDX_TO_ACTION[top_idx]
-    print("[pred_action]", pred_action)
-
-    # ---- save base image
-    base_u8 = np.array(img_rs).astype(np.uint8)
-    Image.fromarray(base_u8).save(os.path.join(args.out_dir, "input_resized.png"))
-
-    # ---- choose which labels to save
-    label_indices = list(range(5)) if int(args.save_all_labels) == 1 else [top_idx]
-
-    # ---- save heatmaps
-    for i in label_indices:
-        name = LABEL_NAMES[i]
-        heat01 = norm01(m0[i])  # (H,W)
-        heat_u8 = tensor_to_u8_gray(heat01)
-
-        # map only
-        Image.fromarray(heat_u8).save(os.path.join(args.out_dir, f"map_{name}.png"))
-
-        # overlay
-        ov = overlay_heatmap_on_image(base_u8, heat_u8, alpha=float(args.alpha))
-        Image.fromarray(ov).save(os.path.join(args.out_dir, f"heatmap_{name}.png"))
-
-    # ---- CSD mask compare (only meaningful for snow)
-    mask_path = infer_csd_mask_path(inp_path)
-    if mask_path is not None and os.path.exists(mask_path):
-        print("[CSD Mask] found:", mask_path)
-        m_img = pil_open_gray(mask_path)
-        m_rs = resize_to_square(m_img, args.img_size, is_mask=True)
-        gt01 = pil_to_tensor_mask(m_rs)[0].clamp(0, 1)  # (H,W)
-
-        pred_snow = norm01(m0[2])  # snow channel index=2
-
-        metrics = compute_iou_dice_mae(pred_snow, gt01, thr=float(args.mask_thr))
-        print(f"[Mask Compare] (snow) IoU={metrics['iou']:.4f}  Dice={metrics['dice']:.4f}  MAE={metrics['mae']:.4f}")
-
-        # save gt mask + overlay + side-by-side
-        gt_u8 = tensor_to_u8_gray(gt01)
-        Image.fromarray(gt_u8).save(os.path.join(args.out_dir, "csd_mask.png"))
-
-        pred_u8 = tensor_to_u8_gray(pred_snow)
-        Image.fromarray(pred_u8).save(os.path.join(args.out_dir, "pred_snow_map.png"))
-
-        ov_gt = overlay_heatmap_on_image(base_u8, gt_u8, alpha=float(args.alpha))
-        Image.fromarray(ov_gt).save(os.path.join(args.out_dir, "mask_overlay.png"))
-
-        ov_pred = overlay_heatmap_on_image(base_u8, pred_u8, alpha=float(args.alpha))
-        Image.fromarray(ov_pred).save(os.path.join(args.out_dir, "pred_overlay.png"))
-
-        # side by side: [input | pred | gt]
-        h, w = base_u8.shape[:2]
-        canvas = np.zeros((h, w * 3, 3), dtype=np.uint8)
-        canvas[:, 0:w] = base_u8
-        canvas[:, w:2 * w] = ov_pred
-        canvas[:, 2 * w:3 * w] = ov_gt
-        Image.fromarray(canvas).save(os.path.join(args.out_dir, "mask_vs_pred.png"))
+    if model_name == "vit_map":
+        model = ViTMapDiagnoser(
+            img_size=a.img_size,
+            patch_size=a.vit_patch,
+            embed_dim=a.vit_dim,
+            depth=a.vit_depth,
+            num_heads=a.vit_heads,
+            num_labels=5,
+        )
     else:
-        print("[CSD Mask] not found (skip compare)")
+        model = CNNMapDiagnoser(num_labels=5, width=a.cnn_width)
 
-    print("[Saved]", args.out_dir)
+    sd = ckpt.get("state_dict", ckpt.get("model_state_dict", None))
+    assert sd is not None, "No state_dict in ckpt"
+    model.load_state_dict(sd, strict=True)
 
+    model.to(device).eval()
+
+    base_img, x = load_rgb(a.image, size=a.img_size)
+    x = x.to(device)
+
+    with torch.no_grad():
+        logits, m0 = model(x)                 # (1,5), (1,5,h,w)
+        probs = torch.sigmoid(logits)[0]      # (5,)
+        m0_up = F.interpolate(m0, size=(a.img_size, a.img_size), mode="bilinear", align_corners=False)[0]  # (5,H,W)
+
+    # ---- print global logits/probs ----
+    print("\n[Global logits/probs]")
+    for i, name in enumerate(LABEL_NAMES):
+        print(f"  {name:5s}: logit={logits[0,i].item():+.4f}  prob={probs[i].item():.4f}")
+
+    # ---- save maps ----
+    for i, name in enumerate(LABEL_NAMES):
+        heat = m0_up[i].detach().cpu().numpy()
+        # normalize to [0,1] for visualization
+        h = heat - heat.min()
+        h = h / (h.max() + 1e-8)
+
+        gray_path = os.path.join(a.outdir, f"m0_{name}.png")
+        over_path = os.path.join(a.outdir, f"overlay_{name}.png")
+        save_heatmap_gray(h, gray_path)
+        save_overlay_red(base_img, h, over_path, alpha=0.6)
+
+    # save base too
+    base_img.save(os.path.join(a.outdir, "input.png"))
+    print(f"\n[Saved] {a.outdir}")
+    print("  - input.png")
+    print("  - m0_*.png (heatmap gray)")
+    print("  - overlay_*.png (heatmap overlay)")
 
 if __name__ == "__main__":
     main()
 
+
+# python scripts/infer_diagnoser_maps.py `
+#   --ckpt "E:/ReAct-IR/checkpoints/diagnoser/diagnoser_best.pth" `
+#   --image "E:/ReAct-IR/data/CSD/Test/Snow/1.tif" `
+#   --outdir "E:/ReAct-IR/results/diagnoser_vis"
 
 # python scripts/infer_diagnoser_map.py --input "E:/ReAct-IR/data/CSD/Test/Snow/1.tif"
 
