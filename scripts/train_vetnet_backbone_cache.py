@@ -7,12 +7,18 @@
 # - PSNR/SSIM computed only every --metric_every steps
 # - Speed knobs: TF32, channels_last, grad_accum, optional torch.compile
 #
+# NEW (2026-02-04): WeightedRandomSampler oversampling WITHOUT increasing epoch length
+#   - raindrop (DayRainDrop/NightRainDrop): 6x frequency
+#   - rain100H: 2x frequency
+#   - CSD / RESIDE-6K: 1x
+#   => steps_per_epoch unchanged, but sampling distribution adjusted
+#
 # Example (Windows PowerShell):
 #   python e:/ReAct-IR/scripts/train_vetnet_backbone_cache.py `
 #     --cache_root E:/ReAct-IR/preload_cache `
 #     --datasets CSD,DayRainDrop,NightRainDrop,rain100H,RESIDE-6K `
 #     --epochs 100 --batch_size 1 --grad_accum 2 --patch 256 --lr 3e-4 `
-#     --dim 48 --bias 1 --volterra_rank 2 `
+#     --dim 64 --bias 0 --volterra_rank 2 `
 #     --num_workers 0 --metric_every 200 --iter_save_interval 300
 # ------------------------------------------------------------
 
@@ -30,7 +36,7 @@ from PIL import Image
 
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torch.amp import autocast, GradScaler
 from tqdm import tqdm
 
@@ -49,6 +55,7 @@ from models.backbone.vetnet import VETNet  # uses models/backbone/{mdta,gdfn,vol
 # ------------------------------------------------------------
 try:
     from skimage.metrics import peak_signal_noise_ratio, structural_similarity
+
     USE_SKIMAGE = True
 except Exception:
     USE_SKIMAGE = False
@@ -88,8 +95,8 @@ def save_triplet(inp_chw: torch.Tensor, pred_chw: torch.Tensor, gt_chw: torch.Te
     h, w, _ = inp.shape
     canvas = np.zeros((h, w * 3, 3), dtype=np.uint8)
     canvas[:, 0:w] = inp
-    canvas[:, w:2 * w] = pr
-    canvas[:, 2 * w:3 * w] = gt
+    canvas[:, w : 2 * w] = pr
+    canvas[:, 2 * w : 3 * w] = gt
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
     Image.fromarray(canvas).save(path)
@@ -123,6 +130,14 @@ def format_time(sec: float) -> str:
     if h > 0:
         return f"{h}h{m:02d}m"
     return f"{m}m{s:02d}s"
+
+
+def count_by_dataset(pairs: List[Tuple[str, str, Dict]]) -> Dict[str, int]:
+    by_ds: Dict[str, int] = {}
+    for _, _, m in pairs:
+        dn = m.get("dataset", "UNKNOWN")
+        by_ds[dn] = by_ds.get(dn, 0) + 1
+    return by_ds
 
 
 # ============================================================
@@ -189,7 +204,7 @@ class PairedCacheDataset(Dataset):
             h, w = inp.shape[:2]
         y0 = random.randint(0, h - patch)
         x0 = random.randint(0, w - patch)
-        return inp[y0:y0 + patch, x0:x0 + patch], gt[y0:y0 + patch, x0:x0 + patch]
+        return inp[y0 : y0 + patch, x0 : x0 + patch], gt[y0 : y0 + patch, x0 : x0 + patch]
 
     @staticmethod
     def _augment_pair(inp: np.ndarray, gt: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -255,6 +270,12 @@ class TrainConfig:
     iter_save_interval: int
     preview_count: int
 
+    # sampler
+    use_weighted_sampler: bool
+    w_dayraindrop: float
+    w_nightraindrop: float
+    w_rain100h: float
+
     seed: int
 
 
@@ -288,6 +309,12 @@ def parse_args() -> TrainConfig:
     ap.add_argument("--iter_save_interval", type=int, default=300)
     ap.add_argument("--preview_count", type=int, default=3)
 
+    # sampler knobs (epoch length fixed)
+    ap.add_argument("--use_weighted_sampler", type=int, default=1)
+    ap.add_argument("--w_dayraindrop", type=float, default=6.0)
+    ap.add_argument("--w_nightraindrop", type=float, default=6.0)
+    ap.add_argument("--w_rain100h", type=float, default=2.0)
+
     ap.add_argument("--seed", type=int, default=123)
 
     a = ap.parse_args()
@@ -314,13 +341,16 @@ def parse_args() -> TrainConfig:
         metric_images_per_batch=int(a.metric_images_per_batch),
         iter_save_interval=int(a.iter_save_interval),
         preview_count=int(a.preview_count),
+        use_weighted_sampler=bool(int(a.use_weighted_sampler)),
+        w_dayraindrop=float(a.w_dayraindrop),
+        w_nightraindrop=float(a.w_nightraindrop),
+        w_rain100h=float(a.w_rain100h),
         seed=int(a.seed),
     )
 
 
 def main():
     cfg = parse_args()
-
     seed_all(cfg.seed)
 
     os.makedirs(cfg.save_root, exist_ok=True)
@@ -346,19 +376,43 @@ def main():
     if len(pairs) == 0:
         raise RuntimeError(f"No pairs found. cache_root={cfg.cache_root} datasets={cfg.datasets}")
 
-    by_ds: Dict[str, int] = {}
-    for _, _, m in pairs:
-        by_ds[m["dataset"]] = by_ds.get(m["dataset"], 0) + 1
+    by_ds_raw = count_by_dataset(pairs)
     print("[CachePairs] total =", len(pairs))
-    for k in sorted(by_ds.keys()):
-        print(f"  - {k}: {by_ds[k]}")
+    for k in sorted(by_ds_raw.keys()):
+        print(f"  - {k}: {by_ds_raw[k]}")
 
     ds = PairedCacheDataset(pairs=pairs, patch=cfg.patch, augment=True)
+
+    # ------------------------------------------------------------
+    # WeightedRandomSampler: change frequency WITHOUT increasing epoch length
+    # ------------------------------------------------------------
+    sampler = None
+    if cfg.use_weighted_sampler:
+        W = {
+            "DayRainDrop": float(cfg.w_dayraindrop),
+            "NightRainDrop": float(cfg.w_nightraindrop),
+            "rain100H": float(cfg.w_rain100h),
+            # CSD / RESIDE-6K default 1.0
+        }
+        weights = [float(W.get(m.get("dataset", ""), 1.0)) for _, _, m in pairs]
+        sampler = WeightedRandomSampler(
+            weights=weights,
+            num_samples=len(pairs),  # ✅ epoch length fixed
+            replacement=True,
+        )
+        print(
+            "[Sampler] WeightedRandomSampler ON "
+            f"| num_samples={len(pairs)} "
+            f"| w_dayraindrop={cfg.w_dayraindrop} w_nightraindrop={cfg.w_nightraindrop} w_rain100H={cfg.w_rain100h}"
+        )
+    else:
+        print("[Sampler] OFF (plain shuffle)")
 
     loader = DataLoader(
         ds,
         batch_size=cfg.batch_size,
-        shuffle=True,
+        shuffle=(sampler is None),
+        sampler=sampler,
         num_workers=cfg.num_workers,
         pin_memory=True,
         drop_last=True,
@@ -459,13 +513,15 @@ def main():
             avg_psnr = (psnr_sum / metric_cnt) if metric_cnt > 0 else 0.0
             avg_ssim = (ssim_sum / metric_cnt) if metric_cnt > 0 else 0.0
 
-            pbar.set_postfix({
-                "L": f"{avg_loss:.4f}",
-                "P": f"{avg_psnr:.2f}" if USE_SKIMAGE else "NA",
-                "S": f"{avg_ssim:.3f}" if USE_SKIMAGE else "NA",
-                "ETA": format_time(eta_sec),
-                "lr": f"{optim.param_groups[0]['lr']:.1e}",
-            })
+            pbar.set_postfix(
+                {
+                    "L": f"{avg_loss:.4f}",
+                    "P": f"{avg_psnr:.2f}" if USE_SKIMAGE else "NA",
+                    "S": f"{avg_ssim:.3f}" if USE_SKIMAGE else "NA",
+                    "ETA": format_time(eta_sec),
+                    "lr": f"{optim.param_groups[0]['lr']:.1e}",
+                }
+            )
 
         # if steps_per_epoch not divisible by grad_accum, flush remaining grads
         if (steps_per_epoch % cfg.grad_accum) != 0:
@@ -520,11 +576,3 @@ if __name__ == "__main__":
     main()
 
 
-"""
- python e:/ReAct-IR/scripts/train_vetnet_backbone_cache.py `
-   --cache_root E:/ReAct-IR/preload_cache `
-   --datasets CSD,DayRainDrop,NightRainDrop,rain100H,RESIDE-6K `
-   --epochs 100 --batch_size 1 --grad_accum 2 --patch 256 --lr 3e-4 `
-   --dim 48 --bias 1 --volterra_rank 2 `
-   --num_workers 0 --metric_every 200 --iter_save_interval 300
-"""

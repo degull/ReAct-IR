@@ -162,9 +162,11 @@ class ValueRolloutDataset(Dataset):
                         gt_scalar = float(y[0] + self.scalar_w_ssim * y[1])
                         self.samples.append((x, y, aid, group_id, gt_scalar))
                         valid_cnt += 1
-                # group only meaningful if it had 2+ candidates
-                if valid_cnt >= 2:
+
+                # ✅ IMPORTANT: group_id must be unique per rollout item
+                if valid_cnt >= 1:
                     group_id += 1
+
 
         # if group_id ended up 0, still safe.
 
@@ -558,3 +560,15 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+"""
+python scripts/train_valuehead.py `
+  --rollouts "E:/ReAct-IR/rollouts/rollouts_train.valuehead_1200.jsonl" `
+  --out_dir  "E:/ReAct-IR/checkpoints/valuehead/valuehead_1200" `
+  --mode all_sweep `
+  --epochs 30 `
+  --batch_size 256 `
+  --num_workers 2 `
+  --balance_actions 1
+
+"""

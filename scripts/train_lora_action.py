@@ -8,7 +8,7 @@
 #   A_DEDROP, A_DEBLUR, A_DESNOW, A_DERAIN, A_DEHAZE
 #
 # Saves:
-#   E:/ReAct-IR/checkpoints/toolbank_lora/{action}/epoch_XXX.pth
+#   E:/ReAct-IR/checkpoints/toolbank_lora/{action}/epoch_XXX_....pth
 # where the checkpoint contains ONLY LoRA weights for that action.
 #
 # Also saves preview images (inp|pred|gt) every --iter_save_interval.
@@ -16,13 +16,25 @@
 # Includes __main__ debug checks:
 # - 1 step loss(before/after) on same batch
 # - saved state_dict tensor/elem counts
-# - save->reload output diff check
+# - save->reload output diff check (LoRA-only fidelity)
+#
+# Key features in this final version:
+#   (1) strict dim-check vs ckpt (detect ckpt dim from patch_embed.weight[0])
+#       -> fail fast if mismatch (e.g. dim48 ckpt into dim64 model)
+#   (2) compat backbone loader:
+#       - accept ckpt as {"state_dict": ...} or plain state_dict
+#       - strip lora keys if ckpt is ToolBank-wrapped
+#       - unwrap ".base." keys if ckpt stores base weights as "*.base.weight"
+#       - remap legacy names: blocks->body, volterra->volt
+#       - duplicate volterra.* -> volt1/volt2 where needed
+#       - print detailed load ratio
+#   (3) save_reload_diff_check uses extract_pure_backbone_state_dict(base_ref)
+#       and loads base2 from it (avoids "Unexpected lora_A/base" issues)
 # ------------------------------------------------------------
 
 import os
 import sys
 import time
-import math
 import argparse
 import random
 from dataclasses import dataclass
@@ -61,6 +73,7 @@ from datasets.lora_dataset import (
 # --------------------------------------------------
 try:
     from skimage.metrics import peak_signal_noise_ratio, structural_similarity
+
     USE_SKIMAGE = True
 except Exception:
     USE_SKIMAGE = False
@@ -107,8 +120,8 @@ def save_triplet(inp_chw: torch.Tensor, pred_chw: torch.Tensor, gt_chw: torch.Te
     h, w, _ = inp.shape
     canvas = np.zeros((h, w * 3, 3), dtype=np.uint8)
     canvas[:, 0:w] = inp
-    canvas[:, w:2 * w] = pr
-    canvas[:, 2 * w:3 * w] = gt
+    canvas[:, w : 2 * w] = pr
+    canvas[:, 2 * w : 3 * w] = gt
 
     safe_makedirs(os.path.dirname(path))
     Image.fromarray(canvas).save(path)
@@ -124,35 +137,25 @@ def compute_psnr_ssim_1(pred_chw: torch.Tensor, gt_chw: torch.Tensor) -> Tuple[f
     return ps, ss
 
 
-def load_backbone_ckpt(model: torch.nn.Module, ckpt_path: str) -> Dict[str, Any]:
-    ckpt = torch.load(ckpt_path, map_location="cpu")
-    if isinstance(ckpt, dict) and "state_dict" in ckpt:
-        sd = ckpt["state_dict"]
-    elif isinstance(ckpt, dict) and any(k.startswith("patch_embed") or k.startswith("encoder") for k in ckpt.keys()):
-        sd = ckpt
-    else:
-        # fallback: maybe saved as plain state_dict
-        sd = ckpt
-
-    missing, unexpected = model.load_state_dict(sd, strict=False)
-    info = {
-        "ckpt_path": ckpt_path,
-        "missing_keys": len(missing),
-        "unexpected_keys": len(unexpected),
-        "example_missing": missing[:10],
-        "example_unexpected": unexpected[:10],
-        "has_state_dict": isinstance(ckpt, dict) and "state_dict" in ckpt,
-    }
-    return info
-
-
 def freeze_all(model: torch.nn.Module):
     for p in model.parameters():
         p.requires_grad = False
 
 
+def state_dict_stats(sd: Dict[str, torch.Tensor]) -> Tuple[int, float]:
+    tensors = 0
+    elems = 0
+    for _, v in sd.items():
+        if torch.is_tensor(v):
+            tensors += 1
+            elems += int(v.numel())
+    return tensors, elems / 1e6
+
+
+# ============================================================
+# ToolBank LoRA SD helpers (supports multiple ToolBank APIs)
+# ============================================================
 def lora_state_dict_for_action(tb: ToolBank, action: str) -> Dict[str, torch.Tensor]:
-    # support either API
     if hasattr(tb, "lora_state_dict_for_action"):
         return tb.lora_state_dict_for_action(action)
     if hasattr(tb, "lora_state_dict"):
@@ -177,24 +180,286 @@ def load_lora_state_dict_for_action(tb: ToolBank, action: str, sd: Dict[str, tor
         return tb.load_lora_state_dict(action, sd, strict=strict)
 
     missing, unexpected = tb.load_state_dict(sd, strict=False)
-
     if strict and (len(unexpected) > 0):
         raise RuntimeError(
             f"Unexpected keys while loading LoRA state_dict (strict=True). "
             f"unexpected={unexpected[:10]} (total {len(unexpected)})"
         )
-
     return {"missing": missing, "unexpected": unexpected}
 
 
-def state_dict_stats(sd: Dict[str, torch.Tensor]) -> Tuple[int, float]:
-    tensors = 0
-    elems = 0
-    for _, v in sd.items():
-        if torch.is_tensor(v):
-            tensors += 1
-            elems += int(v.numel())
-    return tensors, elems / 1e6
+# ============================================================
+# Backbone CKPT compat loader
+# ============================================================
+def _normalize_ckpt_to_state_dict(ckpt_obj: Any) -> Dict[str, torch.Tensor]:
+    """
+    Accept:
+      - {"state_dict": {...}}
+      - {"model": {...}}
+      - plain state_dict
+    """
+    if isinstance(ckpt_obj, dict):
+        if "state_dict" in ckpt_obj and isinstance(ckpt_obj["state_dict"], dict):
+            return ckpt_obj["state_dict"]
+        if "model" in ckpt_obj and isinstance(ckpt_obj["model"], dict):
+            return ckpt_obj["model"]
+        # plain dict of tensors?
+        if any(torch.is_tensor(v) for v in ckpt_obj.values()):
+            return ckpt_obj  # type: ignore
+    raise RuntimeError("Unsupported checkpoint format (expected state_dict or dict with state_dict/model)")
+
+
+def _detect_dim_from_sd(sd: Dict[str, torch.Tensor]) -> Optional[int]:
+    """
+    Try to infer model dim from patch_embed weights.
+    VETNet.patch_embed: Conv2d(in=3,out=dim,k=3)
+    weight shape: [dim, 3, 3, 3]
+    """
+    for k in ("patch_embed.weight", "module.patch_embed.weight"):
+        if k in sd and torch.is_tensor(sd[k]):
+            w = sd[k]
+            if w.ndim == 4 and w.shape[1] == 3:
+                return int(w.shape[0])
+    return None
+
+
+def _strip_lora_keys_from_sd(sd: Dict[str, torch.Tensor]) -> Tuple[Dict[str, torch.Tensor], Dict[str, int]]:
+    """
+    If checkpoint is a ToolBank-wrapped state_dict, it may contain:
+      - ".lora_A." / ".lora_B."
+      - "lora_A." / "lora_B."
+    We remove those to get pure backbone keys only.
+    """
+    stripped = {}
+    n_strip = 0
+    for k, v in sd.items():
+        if (".lora_A." in k) or (".lora_B." in k) or ("lora_A." in k) or ("lora_B." in k):
+            n_strip += 1
+            continue
+        stripped[k] = v
+    return stripped, {"stripped_lora": n_strip, "kept": len(stripped)}
+
+
+def _unwrap_base_keys(sd: Dict[str, torch.Tensor]) -> Tuple[Dict[str, torch.Tensor], Dict[str, int]]:
+    """
+    Some wrappers store base weights as:
+      encoder1.body.0.attn.qkv.base.weight  -> encoder1.body.0.attn.qkv.weight
+    We convert "*.base.(weight|bias)" -> "*(weight|bias)" if target doesn't already exist.
+    """
+    out = dict(sd)
+    n_unwrap = 0
+    for k, v in list(sd.items()):
+        if ".base." not in k:
+            continue
+        k2 = k.replace(".base.", ".")
+        if k2 not in out:
+            out[k2] = v
+            n_unwrap += 1
+    return out, {"unwrapped_base": n_unwrap}
+
+
+def _remap_key_legacy(k: str) -> Tuple[str, Dict[str, int]]:
+    """
+    Legacy mappings observed in your logs:
+      - encoderX.blocks.N.*  -> encoderX.body.N.*
+      - *.volterra.*         -> *.volt1.*  (then we may duplicate to volt2)
+    """
+    stats = {"blocks_to_body": 0, "volterra_to_volt": 0}
+
+    if ".blocks." in k:
+        k = k.replace(".blocks.", ".body.")
+        stats["blocks_to_body"] += 1
+
+    if ".volterra." in k:
+        k = k.replace(".volterra.", ".volt1.")
+        stats["volterra_to_volt"] += 1
+
+    return k, stats
+
+
+def _compat_remap_and_filter_to_model(
+    sd_in: Dict[str, torch.Tensor], model: torch.nn.Module
+) -> Tuple[Dict[str, torch.Tensor], Dict[str, int]]:
+    """
+    Produce a state_dict whose keys match the current model keys as much as possible.
+
+    Steps:
+      1) apply legacy renames (blocks->body, volterra->volt1)
+      2) keep only keys that exist in model AND shapes match
+      3) duplicate volt1 -> volt2 when model expects volt2 and ckpt only has volt1 (for volterra parts)
+    """
+    model_sd = model.state_dict()
+    out: Dict[str, torch.Tensor] = {}
+
+    stats = {
+        "blocks_to_body": 0,
+        "volterra_to_volt": 0,
+        "direct_kept": 0,
+        "shape_mismatch_drop": 0,
+        "missing_in_model_drop": 0,
+        "dup_to_volt2": 0,
+    }
+
+    # 1) remap
+    remapped: Dict[str, torch.Tensor] = {}
+    for k, v in sd_in.items():
+        k2, s = _remap_key_legacy(k)
+        stats["blocks_to_body"] += s["blocks_to_body"]
+        stats["volterra_to_volt"] += s["volterra_to_volt"]
+        remapped[k2] = v
+
+    # 2) keep matching keys by name & shape
+    for k, v in remapped.items():
+        if k not in model_sd:
+            stats["missing_in_model_drop"] += 1
+            continue
+        if not torch.is_tensor(v) or not torch.is_tensor(model_sd[k]):
+            continue
+        if tuple(v.shape) != tuple(model_sd[k].shape):
+            stats["shape_mismatch_drop"] += 1
+            continue
+        out[k] = v
+        stats["direct_kept"] += 1
+
+    # 3) duplicate volt1 -> volt2 if volt2 exists and missing
+    # Example: encoder1.body.0.volt1.* -> encoder1.body.0.volt2.*
+    for k, v in list(out.items()):
+        if ".volt1." not in k:
+            continue
+        k2 = k.replace(".volt1.", ".volt2.")
+        if k2 in model_sd and k2 not in out:
+            if tuple(v.shape) == tuple(model_sd[k2].shape):
+                out[k2] = v
+                stats["dup_to_volt2"] += 1
+
+    return out, stats
+
+
+def load_backbone_ckpt_compat(
+    model: torch.nn.Module,
+    ckpt_path: str,
+    expect_dim: Optional[int] = None,
+    fail_fast_on_dim_mismatch: bool = True,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """
+    Robust backbone loader:
+      - supports ckpt dict formats
+      - strips LoRA keys if present
+      - unwraps base keys if present
+      - remaps legacy names
+      - filters by model keys & shape
+      - prints load ratios
+
+    Returns an info dict (also printed).
+    """
+    ckpt_obj = torch.load(ckpt_path, map_location="cpu")
+    raw_sd = _normalize_ckpt_to_state_dict(ckpt_obj)
+
+    # infer ckpt dim
+    ckpt_dim = _detect_dim_from_sd(raw_sd)
+
+    if expect_dim is not None and ckpt_dim is not None and ckpt_dim != expect_dim:
+        msg = f"[Backbone] DIM MISMATCH: ckpt_dim={ckpt_dim} vs model_dim={expect_dim} ({ckpt_path})"
+        if fail_fast_on_dim_mismatch:
+            raise RuntimeError(msg)
+        else:
+            print(msg)
+
+    # strip lora keys & unwrap base keys (if any)
+    sd1, strip_stats = _strip_lora_keys_from_sd(raw_sd)
+    sd2, unwrap_stats = _unwrap_base_keys(sd1)
+
+    # compat remap + shape filter
+    sd3, remap_stats = _compat_remap_and_filter_to_model(sd2, model)
+
+    # load
+    missing, unexpected = model.load_state_dict(sd3, strict=False)
+
+    # load ratios
+    model_total = len(model.state_dict())
+    ckpt_total = len(raw_sd)
+    loaded_keys = len(sd3)
+
+    # How many of ckpt keys did we actually use (after filtering)?
+    ckpt_used_ratio = 100.0 * loaded_keys / max(1, ckpt_total)
+    model_loaded_ratio = 100.0 * loaded_keys / max(1, model_total)
+
+    info = {
+        "ckpt_path": ckpt_path,
+        "ckpt_total_keys": int(ckpt_total),
+        "model_total_keys": int(model_total),
+        "loaded_keys": int(loaded_keys),
+        "model_loaded_ratio": float(model_loaded_ratio),
+        "ckpt_used_ratio": float(ckpt_used_ratio),
+        "missing_keys": int(len(missing)),
+        "unexpected_keys": int(len(unexpected)),
+        "example_missing": missing[:25],
+        "example_unexpected": unexpected[:25],
+        "has_state_dict": isinstance(ckpt_obj, dict) and ("state_dict" in ckpt_obj),
+        "ckpt_dim": ckpt_dim,
+        "CompatV2": {**strip_stats, **unwrap_stats},
+        "Remap": remap_stats,
+    }
+
+    if verbose:
+        ctor_dim = None
+        # best-effort: read model dim from patch_embed
+        try:
+            ctor_dim = int(model.patch_embed.out_channels)  # type: ignore
+        except Exception:
+            pass
+
+        print(f"[Backbone] ctor: dim={ctor_dim} bias={getattr(model, 'bias', 'NA')} volterra_rank=NA")
+        print(f"[Backbone] ckpt = {ckpt_path}")
+        if ckpt_dim is not None:
+            print(f"[Backbone] ckpt_dim inferred = {ckpt_dim}")
+        print(
+            f"[Backbone] loaded_keys={loaded_keys}/{model_total} "
+            f"({model_loaded_ratio:.2f}% of model, {ckpt_used_ratio:.2f}% of ckpt) "
+            f"| missing={len(missing)} unexpected={len(unexpected)}"
+        )
+        print(f"  [CompatV2] stripped_lora={strip_stats['stripped_lora']} unwrapped_base={unwrap_stats['unwrapped_base']}")
+        print(
+            "  [Remap] "
+            f"blocks->body={remap_stats['blocks_to_body']} "
+            f"volterra->volt={remap_stats['volterra_to_volt']} "
+            f"direct_kept={remap_stats['direct_kept']} "
+            f"dup_to_volt2={remap_stats['dup_to_volt2']} "
+            f"shape_drop={remap_stats['shape_mismatch_drop']} "
+            f"name_drop={remap_stats['missing_in_model_drop']}"
+        )
+
+        if len(missing) > 0:
+            print("  example_missing   :", info["example_missing"])
+        if len(unexpected) > 0:
+            print("  example_unexpected:", info["example_unexpected"])
+
+    return info
+
+
+def extract_pure_backbone_state_dict(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
+    """
+    Extract a "pure backbone" state_dict from any module.
+    Even if called on a ToolBank-wrapped module accidentally, it will:
+      - strip lora keys
+      - unwrap base keys
+      - return only keys that look like backbone weights (heuristic: no lora_A/lora_B)
+    For plain VETNet, it simply returns model.state_dict().
+    """
+    sd = model.state_dict()
+
+    # If it's already pure, these ops are no-ops
+    sd1, _ = _strip_lora_keys_from_sd(sd)
+    sd2, _ = _unwrap_base_keys(sd1)
+
+    # Also remove any leftover keys that still contain lora in name
+    out = {}
+    for k, v in sd2.items():
+        if (".lora_A." in k) or (".lora_B." in k) or ("lora_A." in k) or ("lora_B." in k):
+            continue
+        out[k] = v
+    return out
 
 
 # ============================================================
@@ -240,6 +505,11 @@ class TrainCfg:
     channels_last: bool
     tf32: bool
 
+    # backbone ctor
+    dim: int
+    bias: bool
+    volterra_rank: int
+
     lora_rank: int
     lora_alpha: float
     lora_scale_train: float
@@ -249,13 +519,17 @@ class TrainCfg:
     seed: int
 
     debug_one_step_check: bool
+    fail_fast_on_dim_mismatch: bool
 
 
 def parse_args() -> TrainCfg:
     ap = argparse.ArgumentParser()
 
     ap.add_argument("--action", required=True, help="one of: dedrop,deblur,desnow,derain,dehaze")
-    ap.add_argument("--backbone_ckpt", default="E:/ReAct-IR/checkpoints/backbone/epoch_019_L0.0230_P30.61_S0.9292.pth")
+    ap.add_argument(
+        "--backbone_ckpt",
+        default="E:/ReAct-IR/checkpoints/backbone/epoch_021_L0.0204_P31.45_S0.9371.pth",
+    )
     ap.add_argument("--data_root", default="E:/ReAct-IR/data")
     ap.add_argument("--save_root", default="E:/ReAct-IR/checkpoints/toolbank_lora")
     ap.add_argument("--results_root", default="E:/ReAct-IR/results/lora_train")
@@ -271,6 +545,11 @@ def parse_args() -> TrainCfg:
     ap.add_argument("--channels_last", type=int, default=1)
     ap.add_argument("--tf32", type=int, default=1)
 
+    # backbone ctor args (important!)
+    ap.add_argument("--dim", type=int, default=64, help="VETNet base dim (must match backbone ckpt dim)")
+    ap.add_argument("--bias", type=int, default=0, help="1: WithBiasLayerNorm, 0: BiasFreeLayerNorm")
+    ap.add_argument("--volterra_rank", type=int, default=2, help="Volterra rank used in backbone")
+
     ap.add_argument("--lora_rank", type=int, default=2)
     ap.add_argument("--lora_alpha", type=float, default=1.0)
     ap.add_argument("--lora_scale_train", type=float, default=1.0)
@@ -280,6 +559,7 @@ def parse_args() -> TrainCfg:
     ap.add_argument("--seed", type=int, default=123)
 
     ap.add_argument("--debug_one_step_check", type=int, default=1)
+    ap.add_argument("--fail_fast_on_dim_mismatch", type=int, default=1)
 
     a = ap.parse_args()
     alias, internal = map_action(a.action)
@@ -300,6 +580,9 @@ def parse_args() -> TrainCfg:
         use_amp=bool(int(a.use_amp)),
         channels_last=bool(int(a.channels_last)),
         tf32=bool(int(a.tf32)),
+        dim=int(a.dim),
+        bias=bool(int(a.bias)),
+        volterra_rank=int(a.volterra_rank),
         lora_rank=int(a.lora_rank),
         lora_alpha=float(a.lora_alpha),
         lora_scale_train=float(a.lora_scale_train),
@@ -307,6 +590,7 @@ def parse_args() -> TrainCfg:
         metric_every=int(a.metric_every),
         seed=int(a.seed),
         debug_one_step_check=bool(int(a.debug_one_step_check)),
+        fail_fast_on_dim_mismatch=bool(int(a.fail_fast_on_dim_mismatch)),
     )
 
 
@@ -360,17 +644,31 @@ def save_reload_diff_check(
     tb: ToolBank,
     x: torch.Tensor,
     use_amp: bool,
+    base_ref: torch.nn.Module,
 ) -> Dict[str, float]:
-    tb.eval()
+    """
+    LoRA-only fidelity check:
+      - y0 = tb(x) with LoRA active
+      - save LoRA sd
+      - create a fresh base2 loaded from PURE backbone state of base_ref
+      - wrap ToolBank tb2, load LoRA sd
+      - y1 = tb2(x)
+      - diff = max|y0-y1|
 
+    This must be 0 (or tiny fp16 eps) if save/load is correct.
+    """
+    tb.eval()
     with torch.no_grad():
         y0 = _forward_one(tb, action_internal, x, amp=use_amp)
 
-    sd = lora_state_dict_for_action(tb, action_internal)
-    tensors, elems_m = state_dict_stats(sd)
+    lora_sd = lora_state_dict_for_action(tb, action_internal)
+    tensors, elems_m = state_dict_stats(lora_sd)
 
+    # Fresh backbone
     base2 = VETNet(**base_model_ctor_kwargs)
-    _ = load_backbone_ckpt(base2, cfg.backbone_ckpt)
+    # Load from pure backbone weights extracted from base_ref (not from ckpt file)
+    pure_sd = extract_pure_backbone_state_dict(base_ref)
+    base2.load_state_dict(pure_sd, strict=False)
     freeze_all(base2)
 
     tb2 = ToolBank(
@@ -386,7 +684,7 @@ def save_reload_diff_check(
     if cfg.channels_last and device.type == "cuda":
         tb2 = tb2.to(memory_format=torch.channels_last)
 
-    load_lora_state_dict_for_action(tb2, action_internal, sd, strict=True)
+    load_lora_state_dict_for_action(tb2, action_internal, lora_sd, strict=True)
 
     tb2.eval()
     with torch.no_grad():
@@ -421,7 +719,7 @@ def main():
 
     # ---------------- dataset ----------------
     pair_cfg = ActionPairConfig(action=cfg.action_internal, split="train", data_root=cfg.data_root)
-    pairs, reports = build_action_pairs(pair_cfg)
+    pairs, _reports = build_action_pairs(pair_cfg)
 
     by_ds: Dict[str, int] = {}
     for _, _, m in pairs:
@@ -445,15 +743,20 @@ def main():
     print(f"[Train] steps_per_epoch={steps_per_epoch} batch={cfg.batch_size}")
 
     # ---------------- model + toolbank ----------------
-    base_ctor = dict(dim=48, bias=False, volterra_rank=4)
+    base_ctor = dict(dim=cfg.dim, bias=cfg.bias, volterra_rank=cfg.volterra_rank)
     base = VETNet(**base_ctor)
-    ckpt_info = load_backbone_ckpt(base, cfg.backbone_ckpt)
-    print("[Backbone] ckpt =", ckpt_info["ckpt_path"])
-    print(f"[Backbone] loaded (missing={ckpt_info['missing_keys']} unexpected={ckpt_info['unexpected_keys']})")
-    if ckpt_info["missing_keys"] or ckpt_info["unexpected_keys"]:
-        print("  example_missing   :", ckpt_info["example_missing"])
-        print("  example_unexpected:", ckpt_info["example_unexpected"])
 
+    # robust compat load (also does ckpt dim check)
+    print(f"[Backbone] ctor: dim={cfg.dim} bias={cfg.bias} volterra_rank={cfg.volterra_rank}")
+    _ckpt_info = load_backbone_ckpt_compat(
+        base,
+        cfg.backbone_ckpt,
+        expect_dim=cfg.dim,
+        fail_fast_on_dim_mismatch=cfg.fail_fast_on_dim_mismatch,
+        verbose=True,
+    )
+
+    # freeze backbone
     freeze_all(base)
 
     tb = ToolBank(
@@ -474,12 +777,14 @@ def main():
     else:
         print("[ToolBank] injected (summary() not available)")
 
+    # Make sure everything is frozen before enabling single action
+    freeze_all(tb)
     tp0 = count_trainable_params(tb)
-    print(f"[DEBUG] trainable_params(before set_trainable_action)={tp0:.6f}M (expect 0.0M)")
+    print(f"[DEBUG] trainable_params(after freeze_all(tb))={tp0:.6f}M (expect 0.0M)")
 
     tb.set_trainable_action(cfg.action_internal)
     tp1 = count_trainable_params(tb)
-    print(f"[DEBUG] trainable_params(after set_trainable_action) ={tp1:.6f}M (expect ~0.23M)")
+    print(f"[DEBUG] trainable_params(after set_trainable_action)={tp1:.6f}M")
 
     trainable = [p for p in tb.parameters() if p.requires_grad]
     if len(trainable) == 0:
@@ -495,7 +800,7 @@ def main():
     safe_makedirs(os.path.join(res_dir, "iter"))
 
     # ---------------- debug checks: one batch ----------------
-    x_dbg, y_dbg, meta_dbg = next(iter(loader))
+    x_dbg, y_dbg, _meta_dbg = next(iter(loader))
     if cfg.channels_last and device.type == "cuda":
         x_dbg = x_dbg.to(device, non_blocking=True).to(memory_format=torch.channels_last)
         y_dbg = y_dbg.to(device, non_blocking=True).to(memory_format=torch.channels_last)
@@ -506,12 +811,20 @@ def main():
     if cfg.debug_one_step_check:
         print("\n[DEBUG] one-step loss decrease check (same batch)")
         out = one_step_loss_decrease_check(tb, cfg.action_internal, opt, scaler, x_dbg, y_dbg, cfg.use_amp)
-        print(f"  loss_before={out['loss_before']:.6f}  loss_after={out['loss_after']:.6f}  delta={out['delta']:.6f}")
+        print(
+            f"  loss_before={out['loss_before']:.6f}  "
+            f"loss_after={out['loss_after']:.6f}  "
+            f"delta={out['delta']:.6f}"
+        )
         print("  decreased =", (out["loss_after"] <= out["loss_before"]))
 
-        print("\n[DEBUG] save->reload diff check (same input)")
-        out2 = save_reload_diff_check(cfg, base_ctor, cfg.action_internal, tb, x_dbg[:1], cfg.use_amp)
-        print(f"  saved tensors={int(out2['state_tensors'])} elems={out2['state_elems_M']:.6f}M max_abs_diff_reload={out2['max_abs_diff_reload']:.8f}")
+        print("\n[DEBUG] save->reload diff check (same input)  [LoRA-only fidelity]")
+        out2 = save_reload_diff_check(cfg, base_ctor, cfg.action_internal, tb, x_dbg[:1], cfg.use_amp, base)
+        print(
+            f"  saved tensors={int(out2['state_tensors'])} "
+            f"elems={out2['state_elems_M']:.6f}M "
+            f"max_abs_diff_reload={out2['max_abs_diff_reload']:.8f}"
+        )
 
     # ---------------- training loop ----------------
     print("\n[Train] start")
@@ -527,7 +840,7 @@ def main():
         t0 = time.time()
         pbar = tqdm(loader, ncols=140, desc=f"Epoch {epoch:03d}/{cfg.epochs}")
 
-        for it, (inp, gt, metas) in enumerate(pbar, start=1):
+        for it, (inp, gt, _metas) in enumerate(pbar, start=1):
             if cfg.channels_last and device.type == "cuda":
                 inp = inp.to(device, non_blocking=True).to(memory_format=torch.channels_last)
                 gt = gt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
@@ -566,20 +879,25 @@ def main():
             avg_psnr = (psnr_sum / metric_cnt) if metric_cnt > 0 else 0.0
             avg_ssim = (ssim_sum / metric_cnt) if metric_cnt > 0 else 0.0
 
-            pbar.set_postfix({
-                "L": f"{avg_loss:.4f}",
-                "P": f"{avg_psnr:.2f}" if USE_SKIMAGE else "NA",
-                "S": f"{avg_ssim:.3f}" if USE_SKIMAGE else "NA",
-                "ETA": format_time(eta_sec),
-                "lr": f"{cfg.lr:.1e}",
-            })
+            pbar.set_postfix(
+                {
+                    "L": f"{avg_loss:.4f}",
+                    "P": f"{avg_psnr:.2f}" if USE_SKIMAGE else "NA",
+                    "S": f"{avg_ssim:.3f}" if USE_SKIMAGE else "NA",
+                    "ETA": format_time(eta_sec),
+                    "lr": f"{cfg.lr:.1e}",
+                }
+            )
 
         epoch_loss = loss_sum / max(steps_per_epoch, 1)
         epoch_psnr = (psnr_sum / metric_cnt) if metric_cnt > 0 else 0.0
         epoch_ssim = (ssim_sum / metric_cnt) if metric_cnt > 0 else 0.0
-        print(f"\n[Epoch {epoch:03d}] Loss={epoch_loss:.6f}  PSNR={epoch_psnr:.2f}  SSIM={epoch_ssim:.4f}  time={format_time(time.time()-t0)}")
+        print(
+            f"\n[Epoch {epoch:03d}] Loss={epoch_loss:.6f}  "
+            f"PSNR={epoch_psnr:.2f}  SSIM={epoch_ssim:.4f}  time={format_time(time.time()-t0)}"
+        )
 
-        # ---------------- save LoRA only (filename: epoch_004_L0.0367_P27.24_S0.8868.pth) ----------------
+        # ---------------- save LoRA only ----------------
         sd = lora_state_dict_for_action(tb, cfg.action_internal)
         tensors, elems_m = state_dict_stats(sd)
 
@@ -612,64 +930,16 @@ if __name__ == "__main__":
     main()
 
 
-
 """
-Examples (PowerShell):
-
-# DESNOW
 python -u e:/ReAct-IR/scripts/train_lora_action.py `
-   --action desnow `
-   --backbone_ckpt "E:/ReAct-IR/checkpoints/backbone/epoch_019_L0.0230_P30.61_S0.9292.pth" `
-   --data_root "E:/ReAct-IR/data" `
-   --save_root "E:/ReAct-IR/checkpoints/toolbank_lora" `
-   --results_root "E:/ReAct-IR/results/lora_train" `
-   --epochs 20 --batch_size 1 --patch 256 --lr 3e-4 `
-   --lora_rank 2 --lora_alpha 1.0 --use_amp 1 `
-   --iter_save_interval 300 --metric_every 200
- 
-# DEDROP
-python -u e:/ReAct-IR/scripts/train_lora_action.py `
-   --action dedrop `
-   --backbone_ckpt "E:/ReAct-IR/checkpoints/backbone/epoch_019_L0.0230_P30.61_S0.9292.pth" `
-   --data_root "E:/ReAct-IR/data" `
-   --save_root "E:/ReAct-IR/checkpoints/toolbank_lora" `
-   --results_root "E:/ReAct-IR/results/lora_train" `
-   --epochs 20 --batch_size 1 --patch 256 --lr 3e-4 `
-   --lora_rank 2 --lora_alpha 1.0 --use_amp 1 `
-   --iter_save_interval 300 --metric_every 200
+  --action desnow `
+  --backbone_ckpt "E:/ReAct-IR/checkpoints/backbone/best_backbone.pth" `
+  --data_root "E:/ReAct-IR/data" `
+  --save_root "E:/ReAct-IR/checkpoints/toolbank_lora_dim64" `
+  --results_root "E:/ReAct-IR/results/lora_train_dim64" `
+  --epochs 20 --batch_size 1 --patch 256 --lr 3e-4 `
+  --dim 64 --bias 0 --volterra_rank 2 `
+  --lora_rank 2 --lora_alpha 1.0 --use_amp 1 `
+  --iter_save_interval 300 --metric_every 200
 
-# DERAIN
-python -u e:/ReAct-IR/scripts/train_lora_action.py `
-   --action derain `
-   --backbone_ckpt "E:/ReAct-IR/checkpoints/backbone/epoch_019_L0.0230_P30.61_S0.9292.pth" `
-   --data_root "E:/ReAct-IR/data" `
-   --save_root "E:/ReAct-IR/checkpoints/toolbank_lora" `
-   --results_root "E:/ReAct-IR/results/lora_train" `
-   --epochs 20 --batxwcize 1 --patch 256 --lr 3e-4 `
-   --lora_rank 2 --lora_alpha 1.0 --use_amp 1 `
-   --iter_save_interval 300 --metric_every 200
-
-
-# DEHAZE
-python -u e:/ReAct-IR/scripts/train_lora_action.py `
-   --action dehaze `
-   --backbone_ckpt "E:/ReAct-IR/checkpoints/backbone/epoch_019_L0.0230_P30.61_S0.9292.pth" `
-   --data_root "E:/ReAct-IR/data" `
-   --save_root "E:/ReAct-IR/checkpoints/toolbank_lora" `
-   --results_root "E:/ReAct-IR/results/lora_train" `
-   --epochs 20 --batch_size 1 --patch 256 --lr 3e-4 `
-   --lora_rank 2 --lora_alpha 1.0 --use_amp 1 `
-   --iter_save_interval 300 --metric_every 200
-
-
-# DEBLUR
-python -u e:/ReAct-IR/scripts/train_lora_action.py `
-   --action deblur `
-   --backbone_ckpt "E:/ReAct-IR/checkpoints/backbone/epoch_019_L0.0230_P30.61_S0.9292.pth" `
-   --data_root "E:/ReAct-IR/data" `
-   --save_root "E:/ReAct-IR/checkpoints/toolbank_lora" `
-   --results_root "E:/ReAct-IR/results/lora_train" `
-   --epochs 20 --batch_size 1 --patch 256 --lr 3e-4 `
-   --lora_rank 2 --lora_alpha 1.0 --use_amp 1 `
-   --iter_save_interval 300 --metric_every 200
 """
