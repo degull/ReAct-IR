@@ -2,6 +2,17 @@
 # ------------------------------------------------------------
 # Train a single action LoRA in ToolBank, with frozen VETNet backbone.
 #
+# ✅ "LoRA-only training" verification fully integrated:
+#   (A) Print all trainable parameter NAMES (must be LoRA-only)
+#   (B) Assert NO backbone/base params require_grad=True
+#   (C) Snapshot backbone weights before training -> verify unchanged after:
+#       - one-step update
+#       - each epoch
+#       - final
+#   (D) Gradient audit: verify non-LoRA params have no grads
+#   (E) Optimizer audit: optimizer param set == trainable param set
+#   (F) Save->Reload fidelity check (LoRA-only) (already included, kept)
+#
 # CLI action aliases:
 #   --action {dedrop, deblur, desnow, derain, dehaze}
 # Mapped internally to:
@@ -12,24 +23,6 @@
 # where the checkpoint contains ONLY LoRA weights for that action.
 #
 # Also saves preview images (inp|pred|gt) every --iter_save_interval.
-#
-# Includes __main__ debug checks:
-# - 1 step loss(before/after) on same batch
-# - saved state_dict tensor/elem counts
-# - save->reload output diff check (LoRA-only fidelity)
-#
-# Key features in this final version:
-#   (1) strict dim-check vs ckpt (detect ckpt dim from patch_embed.weight[0])
-#       -> fail fast if mismatch (e.g. dim48 ckpt into dim64 model)
-#   (2) compat backbone loader:
-#       - accept ckpt as {"state_dict": ...} or plain state_dict
-#       - strip lora keys if ckpt is ToolBank-wrapped
-#       - unwrap ".base." keys if ckpt stores base weights as "*.base.weight"
-#       - remap legacy names: blocks->body, volterra->volt
-#       - duplicate volterra.* -> volt1/volt2 where needed
-#       - print detailed load ratio
-#   (3) save_reload_diff_check uses extract_pure_backbone_state_dict(base_ref)
-#       and loads base2 from it (avoids "Unexpected lora_A/base" issues)
 # ------------------------------------------------------------
 
 import os
@@ -152,6 +145,164 @@ def state_dict_stats(sd: Dict[str, torch.Tensor]) -> Tuple[int, float]:
     return tensors, elems / 1e6
 
 
+def _is_lora_key(name: str) -> bool:
+    # conservative: allow ToolBank naming variants
+    n = name.lower()
+    return ("lora_a" in n) or ("lora_b" in n) or (".lora" in n)
+
+
+# ============================================================
+# ✅ LoRA-only verification helpers
+# ============================================================
+def list_trainable_named_params(model: torch.nn.Module) -> List[Tuple[str, torch.Tensor]]:
+    out = []
+    for n, p in model.named_parameters():
+        if p.requires_grad:
+            out.append((n, p))
+    return out
+
+
+def assert_trainable_are_lora_only(model: torch.nn.Module, allow_extra_patterns: Optional[List[str]] = None):
+    """
+    Hard fail if any trainable param name doesn't look like LoRA.
+    """
+    allow_extra_patterns = allow_extra_patterns or []
+    bad = []
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        ok = _is_lora_key(n) or any(pat in n for pat in allow_extra_patterns)
+        if not ok:
+            bad.append(n)
+    if bad:
+        raise RuntimeError(
+            "[LoRA-ONLY CHECK FAIL] Non-LoRA parameters are trainable:\n"
+            + "\n".join(bad[:50])
+            + (f"\n... total bad={len(bad)}" if len(bad) > 50 else "")
+        )
+
+
+@torch.no_grad()
+def snapshot_backbone_tensors(model: torch.nn.Module, keys: List[str]) -> Dict[str, torch.Tensor]:
+    """
+    Snapshot selected tensor values (CPU clone) for later diff check.
+    """
+    sd = model.state_dict()
+    snap: Dict[str, torch.Tensor] = {}
+    for k in keys:
+        if k in sd and torch.is_tensor(sd[k]):
+            snap[k] = sd[k].detach().cpu().clone()
+    return snap
+
+
+@torch.no_grad()
+def backbone_snapshot_diff(model: torch.nn.Module, snap: Dict[str, torch.Tensor]) -> Dict[str, float]:
+    """
+    Return max abs diff for each snapshot key.
+    """
+    sd = model.state_dict()
+    diffs: Dict[str, float] = {}
+    for k, v0 in snap.items():
+        if k not in sd or not torch.is_tensor(sd[k]):
+            diffs[k] = float("nan")
+            continue
+        v1 = sd[k].detach().cpu()
+        diffs[k] = float((v1 - v0).abs().max().item())
+    return diffs
+
+
+def pick_backbone_probe_keys(model: torch.nn.Module, max_keys: int = 8) -> List[str]:
+    """
+    Pick a small set of stable backbone keys to verify 'unchanged':
+    - patch_embed
+    - some early attention/ffn weights if they exist
+    """
+    keys = []
+    sd = model.state_dict()
+    preferred = [
+        "patch_embed.weight",
+        "patch_embed.bias",
+        "encoder1.body.0.attn.qkv.weight",
+        "encoder1.body.0.attn.qkv.bias",
+        "encoder1.body.0.ffn.project_in.weight",
+        "encoder1.body.0.ffn.project_out.weight",
+        "decoder1.body.0.attn.qkv.weight",
+        "refinement.body.0.attn.qkv.weight",
+    ]
+    for k in preferred:
+        if k in sd and torch.is_tensor(sd[k]):
+            keys.append(k)
+    # fallback: add first few tensor keys
+    if len(keys) < max_keys:
+        for k, v in sd.items():
+            if torch.is_tensor(v) and (k not in keys):
+                keys.append(k)
+            if len(keys) >= max_keys:
+                break
+    return keys[:max_keys]
+
+
+def assert_backbone_unchanged(diffs: Dict[str, float], tol: float = 0.0, context: str = ""):
+    bad = [(k, d) for k, d in diffs.items() if (not np.isnan(d)) and (d > tol)]
+    if bad:
+        msg = "\n".join([f"  {k}: {d:.10f}" for k, d in bad[:30]])
+        raise RuntimeError(
+            f"[BACKBONE CHANGED] {context} | tol={tol}\n"
+            f"Max-abs diffs over probe keys:\n{msg}\n"
+            f"... total_changed={len(bad)}"
+        )
+
+
+def optimizer_param_audit(opt: torch.optim.Optimizer, trainable_params: List[torch.Tensor]):
+    """
+    Ensure optimizer has exactly the same params as trainable set.
+    """
+    opt_ids = set()
+    for g in opt.param_groups:
+        for p in g["params"]:
+            opt_ids.add(id(p))
+    tr_ids = set(id(p) for p in trainable_params)
+    if opt_ids != tr_ids:
+        # show a small diff
+        only_opt = list(opt_ids - tr_ids)[:10]
+        only_tr = list(tr_ids - opt_ids)[:10]
+        raise RuntimeError(
+            "[OPTIMIZER AUDIT FAIL] optimizer params != trainable params\n"
+            f"only_in_opt(count={len(opt_ids - tr_ids)}): {only_opt}\n"
+            f"only_in_trainable(count={len(tr_ids - opt_ids)}): {only_tr}"
+        )
+
+
+def gradient_audit_non_lora(tb: ToolBank, strict: bool = True) -> Dict[str, int]:
+    """
+    After backward(), ensure non-LoRA params either have grad None
+    or (if strict=False) have grad ~0.
+    """
+    non_lora_with_grad = 0
+    non_lora_nonzero = 0
+    for n, p in tb.named_parameters():
+        if not p.requires_grad:
+            continue  # only audit trainable set? (we audit all with grad too)
+        # trainable should be LoRA; non-LoRA trainable already caught elsewhere
+    # Now audit ALL params for accidental grads:
+    for n, p in tb.named_parameters():
+        if p.grad is None:
+            continue
+        if _is_lora_key(n):
+            continue
+        non_lora_with_grad += 1
+        if not strict:
+            nz = float(p.grad.detach().abs().max().item())
+            if nz > 0:
+                non_lora_nonzero += 1
+    if strict and non_lora_with_grad > 0:
+        raise RuntimeError(
+            f"[GRAD AUDIT FAIL] Found gradients on non-LoRA params: count={non_lora_with_grad}. "
+            f"(This usually means something trainable leaked or graph is unexpected.)"
+        )
+    return {"non_lora_with_grad": non_lora_with_grad, "non_lora_nonzero": non_lora_nonzero}
+
+
 # ============================================================
 # ToolBank LoRA SD helpers (supports multiple ToolBank APIs)
 # ============================================================
@@ -192,29 +343,17 @@ def load_lora_state_dict_for_action(tb: ToolBank, action: str, sd: Dict[str, tor
 # Backbone CKPT compat loader
 # ============================================================
 def _normalize_ckpt_to_state_dict(ckpt_obj: Any) -> Dict[str, torch.Tensor]:
-    """
-    Accept:
-      - {"state_dict": {...}}
-      - {"model": {...}}
-      - plain state_dict
-    """
     if isinstance(ckpt_obj, dict):
         if "state_dict" in ckpt_obj and isinstance(ckpt_obj["state_dict"], dict):
             return ckpt_obj["state_dict"]
         if "model" in ckpt_obj and isinstance(ckpt_obj["model"], dict):
             return ckpt_obj["model"]
-        # plain dict of tensors?
         if any(torch.is_tensor(v) for v in ckpt_obj.values()):
             return ckpt_obj  # type: ignore
     raise RuntimeError("Unsupported checkpoint format (expected state_dict or dict with state_dict/model)")
 
 
 def _detect_dim_from_sd(sd: Dict[str, torch.Tensor]) -> Optional[int]:
-    """
-    Try to infer model dim from patch_embed weights.
-    VETNet.patch_embed: Conv2d(in=3,out=dim,k=3)
-    weight shape: [dim, 3, 3, 3]
-    """
     for k in ("patch_embed.weight", "module.patch_embed.weight"):
         if k in sd and torch.is_tensor(sd[k]):
             w = sd[k]
@@ -224,12 +363,6 @@ def _detect_dim_from_sd(sd: Dict[str, torch.Tensor]) -> Optional[int]:
 
 
 def _strip_lora_keys_from_sd(sd: Dict[str, torch.Tensor]) -> Tuple[Dict[str, torch.Tensor], Dict[str, int]]:
-    """
-    If checkpoint is a ToolBank-wrapped state_dict, it may contain:
-      - ".lora_A." / ".lora_B."
-      - "lora_A." / "lora_B."
-    We remove those to get pure backbone keys only.
-    """
     stripped = {}
     n_strip = 0
     for k, v in sd.items():
@@ -241,11 +374,6 @@ def _strip_lora_keys_from_sd(sd: Dict[str, torch.Tensor]) -> Tuple[Dict[str, tor
 
 
 def _unwrap_base_keys(sd: Dict[str, torch.Tensor]) -> Tuple[Dict[str, torch.Tensor], Dict[str, int]]:
-    """
-    Some wrappers store base weights as:
-      encoder1.body.0.attn.qkv.base.weight  -> encoder1.body.0.attn.qkv.weight
-    We convert "*.base.(weight|bias)" -> "*(weight|bias)" if target doesn't already exist.
-    """
     out = dict(sd)
     n_unwrap = 0
     for k, v in list(sd.items()):
@@ -259,38 +387,21 @@ def _unwrap_base_keys(sd: Dict[str, torch.Tensor]) -> Tuple[Dict[str, torch.Tens
 
 
 def _remap_key_legacy(k: str) -> Tuple[str, Dict[str, int]]:
-    """
-    Legacy mappings observed in your logs:
-      - encoderX.blocks.N.*  -> encoderX.body.N.*
-      - *.volterra.*         -> *.volt1.*  (then we may duplicate to volt2)
-    """
     stats = {"blocks_to_body": 0, "volterra_to_volt": 0}
-
     if ".blocks." in k:
         k = k.replace(".blocks.", ".body.")
         stats["blocks_to_body"] += 1
-
     if ".volterra." in k:
         k = k.replace(".volterra.", ".volt1.")
         stats["volterra_to_volt"] += 1
-
     return k, stats
 
 
 def _compat_remap_and_filter_to_model(
     sd_in: Dict[str, torch.Tensor], model: torch.nn.Module
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, int]]:
-    """
-    Produce a state_dict whose keys match the current model keys as much as possible.
-
-    Steps:
-      1) apply legacy renames (blocks->body, volterra->volt1)
-      2) keep only keys that exist in model AND shapes match
-      3) duplicate volt1 -> volt2 when model expects volt2 and ckpt only has volt1 (for volterra parts)
-    """
     model_sd = model.state_dict()
     out: Dict[str, torch.Tensor] = {}
-
     stats = {
         "blocks_to_body": 0,
         "volterra_to_volt": 0,
@@ -300,7 +411,6 @@ def _compat_remap_and_filter_to_model(
         "dup_to_volt2": 0,
     }
 
-    # 1) remap
     remapped: Dict[str, torch.Tensor] = {}
     for k, v in sd_in.items():
         k2, s = _remap_key_legacy(k)
@@ -308,7 +418,6 @@ def _compat_remap_and_filter_to_model(
         stats["volterra_to_volt"] += s["volterra_to_volt"]
         remapped[k2] = v
 
-    # 2) keep matching keys by name & shape
     for k, v in remapped.items():
         if k not in model_sd:
             stats["missing_in_model_drop"] += 1
@@ -321,8 +430,6 @@ def _compat_remap_and_filter_to_model(
         out[k] = v
         stats["direct_kept"] += 1
 
-    # 3) duplicate volt1 -> volt2 if volt2 exists and missing
-    # Example: encoder1.body.0.volt1.* -> encoder1.body.0.volt2.*
     for k, v in list(out.items()):
         if ".volt1." not in k:
             continue
@@ -342,21 +449,8 @@ def load_backbone_ckpt_compat(
     fail_fast_on_dim_mismatch: bool = True,
     verbose: bool = True,
 ) -> Dict[str, Any]:
-    """
-    Robust backbone loader:
-      - supports ckpt dict formats
-      - strips LoRA keys if present
-      - unwraps base keys if present
-      - remaps legacy names
-      - filters by model keys & shape
-      - prints load ratios
-
-    Returns an info dict (also printed).
-    """
     ckpt_obj = torch.load(ckpt_path, map_location="cpu")
     raw_sd = _normalize_ckpt_to_state_dict(ckpt_obj)
-
-    # infer ckpt dim
     ckpt_dim = _detect_dim_from_sd(raw_sd)
 
     if expect_dim is not None and ckpt_dim is not None and ckpt_dim != expect_dim:
@@ -366,22 +460,15 @@ def load_backbone_ckpt_compat(
         else:
             print(msg)
 
-    # strip lora keys & unwrap base keys (if any)
     sd1, strip_stats = _strip_lora_keys_from_sd(raw_sd)
     sd2, unwrap_stats = _unwrap_base_keys(sd1)
-
-    # compat remap + shape filter
     sd3, remap_stats = _compat_remap_and_filter_to_model(sd2, model)
 
-    # load
     missing, unexpected = model.load_state_dict(sd3, strict=False)
 
-    # load ratios
     model_total = len(model.state_dict())
     ckpt_total = len(raw_sd)
     loaded_keys = len(sd3)
-
-    # How many of ckpt keys did we actually use (after filtering)?
     ckpt_used_ratio = 100.0 * loaded_keys / max(1, ckpt_total)
     model_loaded_ratio = 100.0 * loaded_keys / max(1, model_total)
 
@@ -404,7 +491,6 @@ def load_backbone_ckpt_compat(
 
     if verbose:
         ctor_dim = None
-        # best-effort: read model dim from patch_embed
         try:
             ctor_dim = int(model.patch_embed.out_channels)  # type: ignore
         except Exception:
@@ -429,7 +515,6 @@ def load_backbone_ckpt_compat(
             f"shape_drop={remap_stats['shape_mismatch_drop']} "
             f"name_drop={remap_stats['missing_in_model_drop']}"
         )
-
         if len(missing) > 0:
             print("  example_missing   :", info["example_missing"])
         if len(unexpected) > 0:
@@ -439,21 +524,9 @@ def load_backbone_ckpt_compat(
 
 
 def extract_pure_backbone_state_dict(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
-    """
-    Extract a "pure backbone" state_dict from any module.
-    Even if called on a ToolBank-wrapped module accidentally, it will:
-      - strip lora keys
-      - unwrap base keys
-      - return only keys that look like backbone weights (heuristic: no lora_A/lora_B)
-    For plain VETNet, it simply returns model.state_dict().
-    """
     sd = model.state_dict()
-
-    # If it's already pure, these ops are no-ops
     sd1, _ = _strip_lora_keys_from_sd(sd)
     sd2, _ = _unwrap_base_keys(sd1)
-
-    # Also remove any leftover keys that still contain lora in name
     out = {}
     for k, v in sd2.items():
         if (".lora_A." in k) or (".lora_B." in k) or ("lora_A." in k) or ("lora_B." in k):
@@ -521,6 +594,10 @@ class TrainCfg:
     debug_one_step_check: bool
     fail_fast_on_dim_mismatch: bool
 
+    # ✅ verification knobs
+    backbone_diff_tol: float
+    grad_audit_strict: bool
+
 
 def parse_args() -> TrainCfg:
     ap = argparse.ArgumentParser()
@@ -545,7 +622,6 @@ def parse_args() -> TrainCfg:
     ap.add_argument("--channels_last", type=int, default=1)
     ap.add_argument("--tf32", type=int, default=1)
 
-    # backbone ctor args (important!)
     ap.add_argument("--dim", type=int, default=64, help="VETNet base dim (must match backbone ckpt dim)")
     ap.add_argument("--bias", type=int, default=0, help="1: WithBiasLayerNorm, 0: BiasFreeLayerNorm")
     ap.add_argument("--volterra_rank", type=int, default=2, help="Volterra rank used in backbone")
@@ -560,6 +636,10 @@ def parse_args() -> TrainCfg:
 
     ap.add_argument("--debug_one_step_check", type=int, default=1)
     ap.add_argument("--fail_fast_on_dim_mismatch", type=int, default=1)
+
+    # ✅ verification knobs
+    ap.add_argument("--backbone_diff_tol", type=float, default=0.0, help="tolerance for backbone max-abs diff checks")
+    ap.add_argument("--grad_audit_strict", type=int, default=1, help="1: any non-LoRA grad -> fail")
 
     a = ap.parse_args()
     alias, internal = map_action(a.action)
@@ -591,6 +671,8 @@ def parse_args() -> TrainCfg:
         seed=int(a.seed),
         debug_one_step_check=bool(int(a.debug_one_step_check)),
         fail_fast_on_dim_mismatch=bool(int(a.fail_fast_on_dim_mismatch)),
+        backbone_diff_tol=float(a.backbone_diff_tol),
+        grad_audit_strict=bool(int(a.grad_audit_strict)),
     )
 
 
@@ -613,6 +695,7 @@ def one_step_loss_decrease_check(
     x: torch.Tensor,
     y: torch.Tensor,
     use_amp: bool,
+    grad_audit_strict: bool,
 ) -> Dict[str, float]:
     tb.train()
     tb.activate(action_internal, scale=1.0)
@@ -626,6 +709,10 @@ def one_step_loss_decrease_check(
         pred = tb(x)
         loss = F.l1_loss(pred, y)
     scaler.scale(loss).backward()
+
+    # ✅ grad audit (non-LoRA grads must be absent)
+    _ga = gradient_audit_non_lora(tb, strict=grad_audit_strict)
+
     scaler.step(opt)
     scaler.update()
     opt.zero_grad(set_to_none=True)
@@ -646,17 +733,6 @@ def save_reload_diff_check(
     use_amp: bool,
     base_ref: torch.nn.Module,
 ) -> Dict[str, float]:
-    """
-    LoRA-only fidelity check:
-      - y0 = tb(x) with LoRA active
-      - save LoRA sd
-      - create a fresh base2 loaded from PURE backbone state of base_ref
-      - wrap ToolBank tb2, load LoRA sd
-      - y1 = tb2(x)
-      - diff = max|y0-y1|
-
-    This must be 0 (or tiny fp16 eps) if save/load is correct.
-    """
     tb.eval()
     with torch.no_grad():
         y0 = _forward_one(tb, action_internal, x, amp=use_amp)
@@ -664,9 +740,7 @@ def save_reload_diff_check(
     lora_sd = lora_state_dict_for_action(tb, action_internal)
     tensors, elems_m = state_dict_stats(lora_sd)
 
-    # Fresh backbone
     base2 = VETNet(**base_model_ctor_kwargs)
-    # Load from pure backbone weights extracted from base_ref (not from ckpt file)
     pure_sd = extract_pure_backbone_state_dict(base_ref)
     base2.load_state_dict(pure_sd, strict=False)
     freeze_all(base2)
@@ -746,7 +820,6 @@ def main():
     base_ctor = dict(dim=cfg.dim, bias=cfg.bias, volterra_rank=cfg.volterra_rank)
     base = VETNet(**base_ctor)
 
-    # robust compat load (also does ckpt dim check)
     print(f"[Backbone] ctor: dim={cfg.dim} bias={cfg.bias} volterra_rank={cfg.volterra_rank}")
     _ckpt_info = load_backbone_ckpt_compat(
         base,
@@ -758,6 +831,13 @@ def main():
 
     # freeze backbone
     freeze_all(base)
+
+    # ✅ Backbone snapshot BEFORE ToolBank wrapping (pure base)
+    probe_keys = pick_backbone_probe_keys(base, max_keys=8)
+    base_snap0 = snapshot_backbone_tensors(base, probe_keys)
+    print("[LoRA-ONLY] backbone probe keys:")
+    for k in probe_keys:
+        print("  -", k)
 
     tb = ToolBank(
         base,
@@ -777,20 +857,32 @@ def main():
     else:
         print("[ToolBank] injected (summary() not available)")
 
-    # Make sure everything is frozen before enabling single action
+    # ✅ Make sure everything is frozen before enabling single action
     freeze_all(tb)
     tp0 = count_trainable_params(tb)
-    print(f"[DEBUG] trainable_params(after freeze_all(tb))={tp0:.6f}M (expect 0.0M)")
+    print(f"[LoRA-ONLY] trainable_params(after freeze_all(tb))={tp0:.6f}M (expect 0.0M)")
+    if tp0 > 1e-9:
+        raise RuntimeError("[LoRA-ONLY CHECK FAIL] Some parameters are still trainable after freeze_all(tb).")
 
+    # ✅ Enable only one action LoRA
     tb.set_trainable_action(cfg.action_internal)
     tp1 = count_trainable_params(tb)
-    print(f"[DEBUG] trainable_params(after set_trainable_action)={tp1:.6f}M")
+    print(f"[LoRA-ONLY] trainable_params(after set_trainable_action)={tp1:.6f}M")
 
-    trainable = [p for p in tb.parameters() if p.requires_grad]
+    trainable_named = list_trainable_named_params(tb)
+    print("[LoRA-ONLY] Trainable parameter list (name, shape):")
+    for n, p in trainable_named:
+        print(f"  - {n}  {tuple(p.shape)}")
+
+    # ✅ HARD ASSERT: trainable must be LoRA-only
+    assert_trainable_are_lora_only(tb)
+
+    trainable = [p for _, p in trainable_named]
     if len(trainable) == 0:
         raise RuntimeError("No trainable params found after set_trainable_action().")
 
     opt = torch.optim.AdamW(trainable, lr=cfg.lr, weight_decay=cfg.weight_decay)
+    optimizer_param_audit(opt, trainable)
     scaler = GradScaler(enabled=(cfg.use_amp and device.type == "cuda"))
 
     save_dir = os.path.join(cfg.save_root, cfg.action_alias)
@@ -808,15 +900,28 @@ def main():
         x_dbg = x_dbg.to(device, non_blocking=True)
         y_dbg = y_dbg.to(device, non_blocking=True)
 
+    # ✅ Backbone snapshot right before any updates (after ToolBank wrap too)
+    # Since base is shared inside tb, checking base itself is enough.
+    base_snap_pre_update = snapshot_backbone_tensors(base, probe_keys)
+
     if cfg.debug_one_step_check:
         print("\n[DEBUG] one-step loss decrease check (same batch)")
-        out = one_step_loss_decrease_check(tb, cfg.action_internal, opt, scaler, x_dbg, y_dbg, cfg.use_amp)
+        out = one_step_loss_decrease_check(
+            tb, cfg.action_internal, opt, scaler, x_dbg, y_dbg, cfg.use_amp, cfg.grad_audit_strict
+        )
         print(
             f"  loss_before={out['loss_before']:.6f}  "
             f"loss_after={out['loss_after']:.6f}  "
             f"delta={out['delta']:.6f}"
         )
         print("  decreased =", (out["loss_after"] <= out["loss_before"]))
+
+        # ✅ Backbone unchanged after one-step update
+        diffs_1step = backbone_snapshot_diff(base, base_snap_pre_update)
+        print("[LoRA-ONLY] backbone diff after one-step update (max-abs):")
+        for k, d in diffs_1step.items():
+            print(f"  - {k}: {d:.10f}")
+        assert_backbone_unchanged(diffs_1step, tol=cfg.backbone_diff_tol, context="after one-step update")
 
         print("\n[DEBUG] save->reload diff check (same input)  [LoRA-only fidelity]")
         out2 = save_reload_diff_check(cfg, base_ctor, cfg.action_internal, tb, x_dbg[:1], cfg.use_amp, base)
@@ -826,11 +931,18 @@ def main():
             f"max_abs_diff_reload={out2['max_abs_diff_reload']:.8f}"
         )
 
+    # ✅ Backbone must still match initial snapshot (sanity)
+    diffs_init = backbone_snapshot_diff(base, base_snap0)
+    assert_backbone_unchanged(diffs_init, tol=cfg.backbone_diff_tol, context="after ToolBank init + debug checks")
+
     # ---------------- training loop ----------------
     print("\n[Train] start")
     for epoch in range(1, cfg.epochs + 1):
         tb.train()
         tb.activate(cfg.action_internal, scale=cfg.lora_scale_train)
+
+        # snapshot at epoch start
+        base_snap_epoch = snapshot_backbone_tensors(base, probe_keys)
 
         loss_sum = 0.0
         psnr_sum = 0.0
@@ -855,6 +967,10 @@ def main():
                 loss = F.l1_loss(pred, gt)
 
             scaler.scale(loss).backward()
+
+            # ✅ grad audit (every iter)
+            gradient_audit_non_lora(tb, strict=cfg.grad_audit_strict)
+
             scaler.step(opt)
             scaler.update()
 
@@ -889,6 +1005,13 @@ def main():
                 }
             )
 
+        # ✅ backbone unchanged after epoch
+        diffs_ep = backbone_snapshot_diff(base, base_snap_epoch)
+        print("\n[LoRA-ONLY] backbone diff after epoch (max-abs):")
+        for k, d in diffs_ep.items():
+            print(f"  - {k}: {d:.10f}")
+        assert_backbone_unchanged(diffs_ep, tol=cfg.backbone_diff_tol, context=f"after epoch {epoch}")
+
         epoch_loss = loss_sum / max(steps_per_epoch, 1)
         epoch_psnr = (psnr_sum / metric_cnt) if metric_cnt > 0 else 0.0
         epoch_ssim = (ssim_sum / metric_cnt) if metric_cnt > 0 else 0.0
@@ -916,12 +1039,30 @@ def main():
                 "use_skimage": bool(USE_SKIMAGE),
             },
             "cfg": vars(cfg),
+            "lora_only_checks": {
+                "probe_keys": probe_keys,
+                "backbone_diff_tol": cfg.backbone_diff_tol,
+            },
         }
 
-        ckpt_name = f"epoch_{epoch:03d}_L{epoch_loss:.4f}_P{epoch_psnr:.2f}_S{epoch_ssim:.4f}.pth"
+        # --- save name formatting exactly like:
+        # epoch_001_L0.0285_P29.37_S0.9355.pth
+        ckpt_name = (
+            f"epoch_{epoch:03d}_"
+            f"L{epoch_loss:.4f}_"
+            f"P{epoch_psnr:.2f}_"
+            f"S{epoch_ssim:.4f}.pth"
+        )
         ckpt_path = os.path.join(save_dir, ckpt_name)
         torch.save(ckpt, ckpt_path)
         print(f"[Save] {ckpt_path}  (tensors={tensors} elems={elems_m:.6f}M)")
+
+    # ✅ final backbone unchanged vs initial
+    diffs_final = backbone_snapshot_diff(base, base_snap0)
+    print("\n[LoRA-ONLY] final backbone diff vs initial snapshot (max-abs):")
+    for k, d in diffs_final.items():
+        print(f"  - {k}: {d:.10f}")
+    assert_backbone_unchanged(diffs_final, tol=cfg.backbone_diff_tol, context="final vs initial")
 
     print("\n[Train] finished")
 
@@ -929,17 +1070,17 @@ def main():
 if __name__ == "__main__":
     main()
 
-
 """
 python -u e:/ReAct-IR/scripts/train_lora_action.py `
-  --action desnow `
+  --action dehaze `
   --backbone_ckpt "E:/ReAct-IR/checkpoints/backbone/best_backbone.pth" `
   --data_root "E:/ReAct-IR/data" `
-  --save_root "E:/ReAct-IR/checkpoints/toolbank_lora_dim64" `
-  --results_root "E:/ReAct-IR/results/lora_train_dim64" `
+  --save_root "E:/ReAct-IR/checkpoints/toolbank_lora" `
+  --results_root "E:/ReAct-IR/results/lora_train" `
   --epochs 20 --batch_size 1 --patch 256 --lr 3e-4 `
   --dim 64 --bias 0 --volterra_rank 2 `
   --lora_rank 2 --lora_alpha 1.0 --use_amp 1 `
-  --iter_save_interval 300 --metric_every 200
-
+  --iter_save_interval 300 --metric_every 200 `
+  --backbone_diff_tol 0.0 `
+  --grad_audit_strict 1
 """
